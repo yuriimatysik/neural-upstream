@@ -1,0 +1,12 @@
+# Third-party SDKs are fetched, not vendored -- see README.
+external/
+
+# build output
+*.addon64
+*.addon64.*
+*.exe
+*.o
+
+# working files
+*.bak*
+*.backup-*

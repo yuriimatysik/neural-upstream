@@ -9,7 +9,8 @@ The network is same-resolution only — it enhances, it does not upscale — so
 running it on the smaller image costs proportionally less and the upscaler still
 does the job it was going to do anyway.
 
-Built and tested against GTA V Enhanced.
+Built and tested against GTA V Enhanced and the Bright Memory: Infinite
+benchmark.
 
 ## How it works
 
@@ -65,12 +66,28 @@ module's path containing `nvngx.dll`; under any other name it returns
 Needs ReShade with add-on support, and `nvngx_dlssnr.dll` in the game folder.
 Everything is configured from the ReShade overlay.
 
+## Where the time goes
+
+The add-on carries a GPU profiler (timestamps around each stage), so the cost is
+measured rather than guessed. On an RTX 4070 Ti at 1280x720 render resolution:
+
+| stage | cost |
+| --- | --- |
+| colour encode | 0.014 ms |
+| **the network** | **3.27 ms** |
+| colour decode | 0.017 ms |
+
+The network is 99% of it, and about a third of a 100 fps frame. The colour
+pipeline is free by comparison, so there is nothing worth optimising on this
+side — cadence is the only lever that moves the number.
+
 ## Status
 
 The network's own strength parameters — intensity, local tone, local structure,
 skin structure — are forwarded and exposed, but **it has not been confirmed that
 the network acts on them**. A sibling parameter, `Hint.Render.Preset`, turned out
-to be inert. Compare *Light* against *Reference* and judge for yourself.
+to be inert. Compare *Light* against *AI slop* and judge for yourself: if those
+two look the same, the parameters do nothing.
 
 ## Licence
 

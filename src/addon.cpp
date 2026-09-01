@@ -125,6 +125,90 @@ static bool g_reset_pending = false;
 // Diagnostics: after a swapchain reset, log the first N evaluates in full so the
 // cadence-2 breakage can be read off the log instead of guessed at.
 static int g_diag_frames = 0;
+// ---- perfilador de GPU -------------------------------------------------------
+// El fps total no dice donde se va el tiempo: si NR es el 5% del frame, una
+// mejora del 20% en la red se ve como 1% en pantalla. Con timestamps de GPU
+// alrededor de cada etapa se mide lo que realmente cuesta cada una.
+struct Prof {
+    ID3D12QueryHeap *heap = nullptr;
+    ID3D12Resource  *rb   = nullptr;      // readback: kSlots x kMarks timestamps
+    bool  ready = false;
+    UINT64 freq = 0;                      // ticks por segundo de la cola
+    unsigned slot = 0, frames = 0;
+    double sum_enc = 0, sum_net = 0, sum_dec = 0, sum_all = 0;
+    unsigned samples = 0;
+};
+static const unsigned kMarks = 4;         // 0 inicio, 1 post-encode, 2 post-red, 3 post-decode
+static const unsigned kPSlots = 4;        // rotacion para no leer lo que aun se ejecuta
+static Prof g_prof;
+static bool g_profiling = true;
+
+static bool prof_init(ID3D12Device *dev) {
+    if (g_prof.ready) return true;
+    if (dev == nullptr) return false;
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = kMarks * kPSlots;
+    if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_prof.heap)))) return false;
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = sizeof(UINT64) * kMarks * kPSlots;
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&g_prof.rb)))) {
+        if (g_prof.heap) { g_prof.heap->Release(); g_prof.heap = nullptr; }
+        return false;
+    }
+    g_prof.ready = true;
+    logf("[NRPRE] perfilador de GPU listo");
+    return true;
+}
+
+static inline void prof_mark(ID3D12GraphicsCommandList *cmd, unsigned m) {
+    if (!g_profiling || !g_prof.ready || cmd == nullptr) return;
+    cmd->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_prof.slot * kMarks + m);
+}
+
+static void prof_resolve(ID3D12GraphicsCommandList *cmd) {
+    if (!g_profiling || !g_prof.ready || cmd == nullptr) return;
+    cmd->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                          g_prof.slot * kMarks, kMarks, g_prof.rb,
+                          sizeof(UINT64) * g_prof.slot * kMarks);
+    g_prof.slot = (g_prof.slot + 1) % kPSlots;
+}
+
+static void prof_report() {
+    if (!g_profiling || !g_prof.ready || g_prof.freq == 0) return;
+    // leer el slot mas viejo: ya se ejecuto seguro
+    const unsigned old = (g_prof.slot + 1) % kPSlots;
+    D3D12_RANGE r{ sizeof(UINT64) * old * kMarks, sizeof(UINT64) * (old + 1) * kMarks };
+    void *p = nullptr;
+    if (FAILED(g_prof.rb->Map(0, &r, &p)) || p == nullptr) return;
+    const UINT64 *t = reinterpret_cast<const UINT64 *>(p) + old * kMarks;
+    if (t[3] > t[0] && t[0] != 0) {
+        const double k = 1000.0 / (double)g_prof.freq;   // ticks -> ms
+        g_prof.sum_enc += (double)(t[1] - t[0]) * k;
+        g_prof.sum_net += (double)(t[2] - t[1]) * k;
+        g_prof.sum_dec += (double)(t[3] - t[2]) * k;
+        g_prof.sum_all += (double)(t[3] - t[0]) * k;
+        ++g_prof.samples;
+    }
+    D3D12_RANGE w{ 0, 0 }; g_prof.rb->Unmap(0, &w);
+    if (g_prof.samples >= 600) {
+        const double n = (double)g_prof.samples;
+        logf("[NRPRE] PERFIL  encode=%.3f ms  red=%.3f ms  decode=%.3f ms  total=%.3f ms  (n=%u)",
+             g_prof.sum_enc / n, g_prof.sum_net / n, g_prof.sum_dec / n, g_prof.sum_all / n,
+             g_prof.samples);
+        g_prof.sum_enc = g_prof.sum_net = g_prof.sum_dec = g_prof.sum_all = 0;
+        g_prof.samples = 0;
+    }
+}
+
+
 // Which side of the cadence actually runs NR. An alt-tab can drop or add a single
 // evaluate, flipping this relative to DLSS's jitter sequence; that is the thing
 // F11 lets us flip back by hand to prove whether parity is the cause.
@@ -772,10 +856,19 @@ static ID3D12Resource *make_uav_tex(ID3D12Device *dev, unsigned w, unsigned h, D
 
 static bool g_setup_done = false;
 
-static PFN_Eval g_orig_eval = nullptr;
+// One trampoline per module we hook. Which module is the live one cannot be told
+// apart by inspection -- an NGX proxy and the driver both export the same entry
+// point and both stay loaded -- so rather than guess, hook every module that
+// exports it and let whichever is actually called identify itself by being
+// called. t_orig carries the trampoline belonging to the hook we entered
+// through, so the body always continues down the right chain.
+static const unsigned kMaxNgx = 8;
+static PFN_Eval g_orig_eval_n[kMaxNgx] = {};
+static thread_local PFN_Eval t_orig_eval = nullptr;
+static PFN_Eval g_orig_eval = nullptr;          // kept for the single-hook paths
 static unsigned g_logged = 0;
 
-static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
+static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params,
         PFN_NVSDK_NGX_ProgressCallback cb)
 {
@@ -981,6 +1074,8 @@ static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
             }
 
             if (run_now) {
+                prof_init(g_device);
+                prof_mark(cmd, 0);
                 if (use_codec) {
                     // scene-linear HDR -> bounded sRGB proxy that DLSSNR expects
                     codec_dispatch(cmd, g_device, g_cx.pso_enc, in, nullptr, nullptr,
@@ -993,7 +1088,9 @@ static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
                 }
 
                 for (int k = 0; k < g_repeat; ++k)
+                    prof_mark(cmd, 1);
                     er = g_snip_eval(cmd, hh, pp, nullptr);
+                    prof_mark(cmd, 2);
                 ++g_eval_count;
                 g_reset_pending = false;   // the network has now seen it
 
@@ -1013,6 +1110,8 @@ static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
                     barrier_transition(cmd, out,        kSRV, kUAV);
                     g_final_valid = true;         // only now does final_tex hold an image
                 }
+                prof_mark(cmd, 3);
+                prof_resolve(cmd);
             } else if (use_codec && g_delta_reuse && g_delta_valid) {
                 // Skipped frame: develop the *current* colour and re-apply the stored
                 // effect to it. No network, so the saving stands, but the image being
@@ -1047,7 +1146,7 @@ static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
                 barrier_transition(cmd, feed, kUAV, kSRV);
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, feed);
-                NVSDK_NGX_Result gr = g_orig_eval(cmd, feat, params, cb);
+                NVSDK_NGX_Result gr = t_orig_eval(cmd, feat, params, cb);
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, src);
                 barrier_transition(cmd, feed, kSRV, kUAV);
@@ -1081,8 +1180,44 @@ static NVSDK_NGX_Result NVSDK_CONV hk_eval(ID3D12GraphicsCommandList *cmd,
             }
         }
     }
-    return g_orig_eval(cmd, feat, params, cb);
+    return t_orig_eval(cmd, feat, params, cb);
 }
+
+// A proxy forwards to the driver, so one game call can enter our hooks twice.
+// Only the outermost interception should do any work; the inner one is just a
+// link in the chain and must pass straight through, or the network would run
+// twice on the same frame and the colour would be developed twice over.
+static thread_local int t_depth = 0;
+
+static NVSDK_NGX_Result eval_dispatch(unsigned idx, ID3D12GraphicsCommandList *cmd,
+        const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params,
+        PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    PFN_Eval orig = g_orig_eval_n[idx];
+    if (orig == nullptr) return NVSDK_NGX_Result_Fail;
+    if (t_depth > 0) return orig(cmd, feat, params, cb);   // nested: just forward
+
+    PFN_Eval saved = t_orig_eval;
+    t_orig_eval = orig;
+    ++t_depth;
+    NVSDK_NGX_Result r = eval_body(cmd, feat, params, cb);
+    --t_depth;
+    t_orig_eval = saved;
+    return r;
+}
+
+template <unsigned N>
+static NVSDK_NGX_Result NVSDK_CONV hk_eval_t(ID3D12GraphicsCommandList *cmd,
+        const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params,
+        PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    return eval_dispatch(N, cmd, feat, params, cb);
+}
+
+static void *const kEvalThunks[kMaxNgx] = {
+    (void *)&hk_eval_t<0>, (void *)&hk_eval_t<1>, (void *)&hk_eval_t<2>, (void *)&hk_eval_t<3>,
+    (void *)&hk_eval_t<4>, (void *)&hk_eval_t<5>, (void *)&hk_eval_t<6>, (void *)&hk_eval_t<7>,
+};
 
 // ---- CreateFeature hook: learn the DLSSNR feature id and the params it is given ----
 typedef NVSDK_NGX_Result (STDMETHODCALLTYPE *PFN_GetU)(const NVSDK_NGX_Parameter *, const char *, unsigned *);
@@ -1475,6 +1610,13 @@ static void apply_preset(int p) {
             g_skin_structure = 0.40f; break;                       // Moderate
     case 3: g_intensity = 1.00f; g_local_tone = 1.00f; g_local_structure = 1.00f;
             g_skin_structure = -1.0f; break;                       // Reference
+    // Mas alla de lo que la red pretende. La linea base de la comunidad es 1.00 y
+    // subir de ahi esta reportado como peor -- que es justamente el punto de estos
+    // dos: empujar el realce hasta que se note que es artificial.
+    case 4: g_intensity = 1.30f; g_local_tone = 1.25f; g_local_structure = 1.45f;
+            g_skin_structure = 1.20f; break;                       // Overdrive
+    case 5: g_intensity = 1.80f; g_local_tone = 1.60f; g_local_structure = 2.00f;
+            g_skin_structure = 1.90f; break;                       // AI slop
     default: break;                     // custom: leave whatever the user set
     }
 }
@@ -1549,8 +1691,9 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
 
     ImGui::Spacing();
     ImGui::TextDisabled("How far it may go");
-    const char *presets[] = { "Custom", "Light", "Moderate", "Reference" };
-    if (ImGui::Combo("How transformative", &g_preset, presets, 4)) {
+    const char *presets[] = { "Custom", "Light", "Moderate", "Reference",
+                              "Overdrive", "AI slop" };
+    if (ImGui::Combo("How transformative", &g_preset, presets, 6)) {
         apply_preset(g_preset); changed = true;
     }
     ImGui::SetItemTooltip("How far the network is allowed to reinterpret the image. "
@@ -1562,6 +1705,11 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     case 2: ImGui::TextDisabled("Half way: detail is enhanced but not rebuilt."); break;
     case 3: ImGui::TextDisabled("Everything the network wants to do. Most detail, most "
                                 "reinterpretation."); break;
+    case 4: ImGui::TextDisabled("Past what the network intends. Detail is pushed until it "
+                                "starts looking drawn rather than photographed."); break;
+    case 5: ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                               "Deliberately overcooked. Skin turns waxy and surfaces grow "
+                               "detail that was never in the scene."); break;
     default: ImGui::TextDisabled("Set by hand in Advanced."); break;
     }
 
@@ -1663,15 +1811,16 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         ImGui::Spacing();
         ImGui::SeparatorText("Network parameters");
         ImGui::TextDisabled("What the preset above sets. 1.00 across the board is the "
-                            "reference; higher is reported to look worse.");
+                            "reference; above that is where Overdrive and AI slop live, "
+                            "and it is reported to look worse -- on purpose.");
         bool net = false;
         changed |= ImGui::Checkbox("Automatic mask", &g_auto_mask);
         ImGui::SetItemTooltip("Lets the network decide per pixel where to apply its result. "
                               "Without it the final blend is uniform.");
-        net |= ImGui::SliderFloat("Intensity", &g_intensity, 0.0f, 1.0f, "%.2f");
-        net |= ImGui::SliderFloat("Local tone", &g_local_tone, 0.0f, 1.0f, "%.2f");
-        net |= ImGui::SliderFloat("Local structure", &g_local_structure, 0.0f, 1.0f, "%.2f");
-        net |= ImGui::SliderFloat("Skin structure", &g_skin_structure, -1.0f, 1.0f, "%.2f");
+        net |= ImGui::SliderFloat("Intensity", &g_intensity, 0.0f, 2.0f, "%.2f");
+        net |= ImGui::SliderFloat("Local tone", &g_local_tone, 0.0f, 2.0f, "%.2f");
+        net |= ImGui::SliderFloat("Local structure", &g_local_structure, 0.0f, 2.0f, "%.2f");
+        net |= ImGui::SliderFloat("Skin structure", &g_skin_structure, -1.0f, 2.0f, "%.2f");
         ImGui::SetItemTooltip("-1 follows Local structure.");
         if (net) { g_preset = 0; changed = true; }
         ImGui::Spacing();
@@ -1918,29 +2067,67 @@ static bool g_hooked = false;
 
 static void install_hook() {
     if (g_hooked) return;
-    HMODULE ngx = GetModuleHandleW(L"_nvngx.dll");
-    if (ngx == nullptr) return;                    // not loaded yet, retry next present
-    g_hooked = true;                               // only ever try once
-    auto target = GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature");
-    if (target == nullptr) { logf("[NRPRE] export NVSDK_NGX_D3D12_EvaluateFeature not found"); return; }
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&install_hook), &self);
+
+    // Gather every loaded module that offers the NGX evaluate. The driver's own
+    // _nvngx.dll is the usual provider, but a proxy (OptiScaler and friends)
+    // answers the same calls in games that have no native DLSS, and both are
+    // loaded at once. Waiting for the driver alone leaves those games unhooked;
+    // picking by name or by a timer picks wrong. Hook them all instead.
+    HMODULE cands[kMaxNgx];
+    unsigned n = 0;
+    if (HMODULE drv = GetModuleHandleW(L"_nvngx.dll"))
+        if (GetProcAddress(drv, "NVSDK_NGX_D3D12_EvaluateFeature")) cands[n++] = drv;
+
+    HMODULE mods[512];
+    DWORD needed = 0;
+    if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &needed)) {
+        const unsigned total = needed / sizeof(HMODULE);
+        for (unsigned i = 0; i < total && n < kMaxNgx; ++i) {
+            if (mods[i] == self) continue;                 // never hook ourselves
+            bool dup = false;
+            for (unsigned k = 0; k < n; ++k) dup |= (cands[k] == mods[i]);
+            if (dup) continue;
+            if (GetProcAddress(mods[i], "NVSDK_NGX_D3D12_EvaluateFeature")) cands[n++] = mods[i];
+        }
+    }
+    if (n == 0) return;                                    // nothing loaded yet, retry next present
+
     if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
         logf("[NRPRE] MH_Initialize failed"); return;
     }
-    MH_STATUS s = MH_CreateHook(reinterpret_cast<LPVOID>(target),
-                                reinterpret_cast<LPVOID>(&hk_eval),
-                                reinterpret_cast<LPVOID *>(&g_orig_eval));
-    if (s != MH_OK) { logf("[NRPRE] MH_CreateHook failed: %d", (int)s); return; }
-    s = MH_EnableHook(reinterpret_cast<LPVOID>(target));
-    logf("[NRPRE] hook on _nvngx!NVSDK_NGX_D3D12_EvaluateFeature: %s (target=%p)",
-         s == MH_OK ? "OK" : "FAILED", (void *)target);
+    g_hooked = true;                                       // only ever try once
 
-    auto ctarget = GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature");
-    if (ctarget != nullptr &&
-        MH_CreateHook(reinterpret_cast<LPVOID>(ctarget), reinterpret_cast<LPVOID>(&hk_create),
-                      reinterpret_cast<LPVOID *>(&g_orig_create)) == MH_OK) {
-        MH_STATUS cs = MH_EnableHook(reinterpret_cast<LPVOID>(ctarget));
-        logf("[NRPRE] hook on _nvngx!NVSDK_NGX_D3D12_CreateFeature: %s",
-             cs == MH_OK ? "OK" : "FAILED");
+    unsigned ok = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        auto target = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_EvaluateFeature");
+        if (target == nullptr) continue;
+        if (MH_CreateHook(reinterpret_cast<LPVOID>(target),
+                          const_cast<LPVOID>(kEvalThunks[i]),
+                          reinterpret_cast<LPVOID *>(&g_orig_eval_n[i])) != MH_OK) continue;
+        const bool on = MH_EnableHook(reinterpret_cast<LPVOID>(target)) == MH_OK;
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(cands[i], path, MAX_PATH);
+        logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S",
+             i, on ? "OK" : "FAILED", path);
+        if (on) { ++ok; if (g_orig_eval == nullptr) g_orig_eval = g_orig_eval_n[i]; }
+    }
+    if (ok == 0) { logf("[NRPRE] no NGX evaluate could be hooked"); return; }
+
+    // The create hook only reads what the game asks for, so one is enough: take
+    // it from the driver when present, otherwise from the first candidate.
+    for (unsigned i = 0; i < n; ++i) {
+        auto ctarget = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_CreateFeature");
+        if (ctarget == nullptr) continue;
+        if (MH_CreateHook(reinterpret_cast<LPVOID>(ctarget), reinterpret_cast<LPVOID>(&hk_create),
+                          reinterpret_cast<LPVOID *>(&g_orig_create)) != MH_OK) continue;
+        if (MH_EnableHook(reinterpret_cast<LPVOID>(ctarget)) == MH_OK) {
+            logf("[NRPRE] hook on NVSDK_NGX_D3D12_CreateFeature: OK (module %u)", i);
+        }
+        break;
     }
 }
 

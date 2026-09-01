@@ -89,6 +89,13 @@ the network acts on them**. A sibling parameter, `Hint.Render.Preset`, turned ou
 to be inert. Compare *Light* against *AI slop* and judge for yourself: if those
 two look the same, the parameters do nothing.
 
+## Findings
+
+[FINDINGS.md](FINDINGS.md) collects what came out of this: how to rebuild the
+NR runtime for another architecture, which Hopper features have no Ada
+equivalent and what to put in their place, where the time actually goes, and
+the optimisations that measured null or negative.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

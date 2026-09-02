@@ -1,7 +1,12 @@
 // DLSS5 NR Pre-Upscale - stage 1: observe the game's NGX DLSS contract (read-only)
 #include <windows.h>
 #define ImTextureID ImU64
+// The overlay is ReShade's to draw. The standalone proxy compiles this same
+// file with NR_STANDALONE and takes its settings from an ini instead, so the
+// one block that needs ImGui is the one block excluded.
+#ifndef NR_STANDALONE
 #include <imgui.h>
+#endif
 #include <d3d12.h>
 #include <cstdio>
 #include <cstdint>
@@ -131,6 +136,14 @@ static int g_diag_frames = 0;
 // every present. None of that belongs in a session that is being played rather
 // than measured, so it all hangs off one switch.
 static bool g_diagnostics = true;
+
+#ifdef NR_STANDALONE
+static reshade::api::device        g_host_dev;
+static reshade::api::command_queue g_host_queue;
+static void on_present(reshade::api::command_queue *, reshade::api::swapchain *,
+                       const reshade::api::rect *, const reshade::api::rect *,
+                       uint32_t, const reshade::api::rect *);
+#endif
 
 // ---- perfilador de GPU -------------------------------------------------------
 // El fps total no dice donde se va el tiempo: si NR es el 5% del frame, una
@@ -1074,6 +1087,23 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params,
         PFN_NVSDK_NGX_ProgressCallback cb)
 {
+#ifdef NR_STANDALONE
+    // The frame tick, at the top of the hook and unconditional.
+    //
+    // Standalone there is no ReShade present event, and the proxy must not put a
+    // second detour on this same function -- two MinHook instances on one address
+    // is a trampoline written over a trampoline. So it runs from here.
+    //
+    // It has to sit before every early return rather than inside the block that
+    // does the work. This is also where the keys are read, and buried further down
+    // it stopped running the moment F7 switched the network off, which left no way
+    // to switch it back on.
+    if (g_host_queue.native != nullptr) {
+        g_host_queue.dev = &g_host_dev;
+        on_present(&g_host_queue, nullptr, nullptr, nullptr, 0, nullptr);
+    }
+#endif
+
     {   // heartbeat: proves whether the hook survives a device/swapchain recreation
         static unsigned long long hb = 0;
         if ((hb++ % 60ull) == 0ull)
@@ -1248,7 +1278,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // Count evaluates, not presents: ReShade calls on_present about twice
             // per DLSS evaluate, so a present-based counter made "every 2" step by 2
             // and fire on every single frame.
-            const unsigned long long tick = g_eval_tick++;
+    const unsigned long long tick = g_eval_tick++;
             // Identify the frame by its jitter, not by how many times we were called.
             float cjx = 0.0f, cjy = 0.0f;
             {
@@ -1605,6 +1635,19 @@ static const NVSDK_NGX_Feature kFeatureDLSSNR = (NVSDK_NGX_Feature)18;   // Rese
 typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_AllocParams)(NVSDK_NGX_Parameter **);
 // The snippet's Init_Ext (5 args) only accepts this app id:
 //   mov ecx, 0x876232c ; r9d = 0x15 ; [rsp+0x20] = nullptr ; call NVSDK_NGX_D3D12_Init_Ext
+#ifdef NR_STANDALONE
+// Standalone this file is compiled into nvngx.dll.nr and calls the snippet
+// directly, exactly as the ReShade build calls it from nvngx.dll.addon64. The
+// file name is the gate, and this module carries it.
+//
+// A thin forwarder was tried first -- the add-on in version.dll and four exports
+// in a satellite -- and it fails in a way worth remembering: Init_Ext is accepted
+// and CreateFeature enters and never returns. The snippet is not merely checking
+// a return address; whatever it reconciles at creation has to belong to the same
+// module that initialised it.
+extern HMODULE g_satellite_module;
+#endif
+#define SNIP_ENTRY(mod, name, sat_name) GetProcAddress(mod, name)
 static const unsigned long long kNgxAppId = 0x0876232Cull;
 typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_SnipInitExt)(unsigned long long, const wchar_t *,
                                                        ID3D12Device *, NVSDK_NGX_Version,
@@ -1717,22 +1760,47 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         HMODULE snip = GetModuleHandleW(L"nvngx_dlssnr.dll");
         if (snip == nullptr) snip = LoadLibraryW(L"nvngx_dlssnr.dll");
         wchar_t self[MAX_PATH] = L"";
-        GetModuleFileNameW(g_self_module, self, MAX_PATH);
+    #ifdef NR_STANDALONE
+    // Without its own DllMain there is no self-handle; the satellite's is ours.
+    GetModuleFileNameW(g_satellite_module, self, MAX_PATH);
+#else
+    GetModuleFileNameW(g_self_module, self, MAX_PATH);
+#endif
         logf("[NRPRE] 2b: snippet route, self=%S", self);
         if (snip != nullptr) {
-            auto si = reinterpret_cast<PFN_SnipInitExt>(GetProcAddress(snip, "NVSDK_NGX_D3D12_Init_Ext"));
-            auto sc = reinterpret_cast<PFN_Create>(GetProcAddress(snip, "NVSDK_NGX_D3D12_CreateFeature"));
+            auto si = reinterpret_cast<PFN_SnipInitExt>(SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_Init_Ext", "nr_init"));
+            auto sc = reinterpret_cast<PFN_Create>(SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_CreateFeature", "nr_create"));
+            // Initialise the snippet at most once per process. The retry loop above
+            // exists because the runtime comes up lazily, but re-initialising one that
+            // is already up is a different thing entirely -- it hung the game to a
+            // black screen the first time this ran standalone.
+            static bool s_init_done = false;
+            static NVSDK_NGX_Result s_init_res = NVSDK_NGX_Result_Fail;
             if (si && sc) {
                 wchar_t lp[MAX_PATH] = L"";
                 GetEnvironmentVariableW(L"LOCALAPPDATA", lp, MAX_PATH);
-                NVSDK_NGX_Result ri = si(kNgxAppId, lp[0] ? lp : L".", g_device,
+                NVSDK_NGX_Result ri = s_init_res;
+                if (!s_init_done) {
+                    s_init_done = true;
+                    ri = s_init_res = si(kNgxAppId, lp[0] ? lp : L".", g_device,
                                          (NVSDK_NGX_Version)0x15, nullptr);
-                logf("[NRPRE] 2b: SNIPPET Init_Ext -> 0x%08X", (unsigned)ri);
+                    logf("[NRPRE] 2b: SNIPPET Init_Ext -> 0x%08X", (unsigned)ri);
+                }
                 if (ri == NVSDK_NGX_Result_Success) {
+                    // Logged on both sides of the call: standalone this is where the
+                    // process stops without a word, and the pair of lines is what
+                    // distinguishes "never entered" from "entered and never returned".
+                    logf("[NRPRE] 2b: -> SNIPPET CreateFeature sc=%p cmd=%p params=%p",
+                         (void *)sc, (void *)cmd, (void *)g_nr_params);
                     r = sc(cmd, kFeatureDLSSNR, g_nr_params, &g_nr_handle);
+                    logf("[NRPRE] 2b: <- returned");
                     logf("[NRPRE] 2b: SNIPPET CreateFeature(18, %ux%u) -> 0x%08X handle=%p",
                          w, h, (unsigned)r, (void *)g_nr_handle);
                 }
+                // Whatever happened, stop here. Retrying a creation that failed once
+                // has never produced a handle, and doing it every frame is how a
+                // failure becomes a hang instead of simply no effect.
+                if (g_nr_handle == nullptr) { g_setup_done = true; return; }
             }
         }
     }
@@ -1740,7 +1808,7 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         g_nr_out = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
         HMODULE snip = GetModuleHandleW(L"nvngx_dlssnr.dll");
         if (snip) g_snip_eval = reinterpret_cast<PFN_Eval>(
-                      GetProcAddress(snip, "NVSDK_NGX_D3D12_EvaluateFeature"));
+                      SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_EvaluateFeature", "nr_eval"));
         logf("[NRPRE] 2c: ready out=%p eval=%p", (void *)g_nr_out, (void *)g_snip_eval);
     }
     g_setup_done = true;
@@ -2048,6 +2116,7 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "AutoPaperWhite", g_auto_pw ? 1 : 0);
 }
 
+#ifndef NR_STANDALONE
 static void draw_overlay(reshade::api::effect_runtime *rt) {
     bool changed = false;
 
@@ -2253,6 +2322,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
 
     if (changed) save_settings(rt);
 }
+#endif  // NR_STANDALONE
 
 // Exposure is a global, slowly-varying property, so sample it a few times a
 // second and read the result back a few frames later -- never stalling the GPU.
@@ -2436,7 +2506,7 @@ static void release_state(const char *why) {
         HMODULE snip = GetModuleHandleW(L"nvngx_dlssnr.dll");
         typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_Release)(NVSDK_NGX_Handle *);
         auto rel = snip ? reinterpret_cast<PFN_Release>(
-                       GetProcAddress(snip, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
+                       SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_ReleaseFeature", "nr_release")) : nullptr;
         if (rel) rel(g_nr_handle);
         g_nr_handle = nullptr;
     }
@@ -2608,6 +2678,26 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
 
     // F10 stamps the log so a visual event can be located exactly: the breakage
     // leaves no DXGI or state trace, so the timestamp has to come from the user.
+    // F6 cycles the effect between normal, exaggerated and off.
+    //
+    // Without an overlay there is no way to see whether the network is doing
+    // anything, and "is it on?" is not a question a subtle effect can answer. The
+    // strength is a blend factor toward the network's result, so pushing it past 1
+    // extrapolates and turns a subtle change into an obvious one. If 3.0 looks
+    // wrong in an obvious way, the whole pipeline is alive; if it looks identical,
+    // nothing is reaching the screen and the strength is not the problem.
+    static bool ex_prev = false;
+    const bool ex_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (ex_down && !ex_prev) {
+        g_effect_strength = (g_effect_strength > 2.0f)  ? 0.0f
+                          : (g_effect_strength < 0.01f) ? 1.0f
+                                                        : 3.0f;
+        logf("[NRPRE] F6: EffectStrength = %.1f  (%s)", g_effect_strength,
+             g_effect_strength > 2.0f  ? "EXAGERADO -- si no se nota, no llega a pantalla" :
+             g_effect_strength < 0.01f ? "apagado" : "normal");
+    }
+    ex_prev = ex_down;
+
     static bool mark_prev = false;
     const bool mark_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (mark_down && !mark_prev) {
@@ -2679,6 +2769,9 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     // install_snippet_hook();
 }
 
+// Standalone the proxy owns DllMain; all this one does is announce the add-on
+// to ReShade and register its events, none of which exists there.
+#ifndef NR_STANDALONE
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     switch (reason) {
@@ -2688,7 +2781,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+#ifndef NR_STANDALONE
         reshade::register_overlay("NR Pre-Upscale", draw_overlay);
+#endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
         reshade::register_event<reshade::addon_event::present>(on_present);
         logf("[NRPRE] addon registered (NR at render resolution -- configure in the ReShade overlay)");
@@ -2704,3 +2799,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     return TRUE;
 }
+#endif  // NR_STANDALONE
+
+#ifdef NR_STANDALONE
+// The standalone proxy drives the same four entry points ReShade used to call.
+// Only the caller changes: the logic below this line is the add-on's, unchanged.
+//
+// The present tick runs from the evaluate hook rather than a real Present hook.
+// What it actually requires is that the *previous* frame's command list has been
+// submitted before its fences are signalled -- and by the time the next frame's
+// first evaluate arrives, it has. That is the whole reason the original comment
+// says "signal here, not in the eval hook", and it is satisfied either way,
+// without hooking the DXGI swapchain to find out.
+
+extern "C" __declspec(dllexport) void nr_host_device(void *d3d12_device) {
+    g_host_dev.native = d3d12_device;
+    g_host_dev.api = reshade::api::device_api::d3d12;
+    on_init_device(&g_host_dev);
+    load_settings(nullptr);
+    install_hook();
+}
+
+extern "C" __declspec(dllexport) void nr_host_queue(void *d3d12_queue) {
+    // The queue the readback fences signal on. Handed over once; the frame tick
+    // itself runs from the add-on's own evaluate hook, so nothing else is needed.
+    g_host_queue.native = d3d12_queue;
+    g_host_queue.dev = &g_host_dev;
+}
+
+extern "C" __declspec(dllexport) void nr_host_swapchain_resized() {
+    on_init_swapchain(nullptr, true);
+}
+#endif  // NR_STANDALONE

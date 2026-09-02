@@ -10,3 +10,7 @@ external/
 # working files
 *.bak*
 *.backup-*
+
+# proxy build output
+proxy/version.dll
+proxy/nvngx.dll.nr

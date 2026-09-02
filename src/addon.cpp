@@ -125,6 +125,13 @@ static bool g_reset_pending = false;
 // Diagnostics: after a swapchain reset, log the first N evaluates in full so the
 // cadence-2 breakage can be read off the log instead of guessed at.
 static int g_diag_frames = 0;
+// Every logf() writes to the log file, with a lock and a flush, on the thread that
+// called it -- and the F10 experiment showed a stall on the present thread is
+// visible on screen. prof_report() additionally Maps and Unmaps a readback buffer
+// every present. None of that belongs in a session that is being played rather
+// than measured, so it all hangs off one switch.
+static bool g_diagnostics = true;
+
 // ---- perfilador de GPU -------------------------------------------------------
 // El fps total no dice donde se va el tiempo: si NR es el 5% del frame, una
 // mejora del 20% en la red se ve como 1% en pantalla. Con timestamps de GPU
@@ -136,9 +143,12 @@ struct Prof {
     UINT64 freq = 0;                      // ticks por segundo de la cola
     unsigned slot = 0, frames = 0;
     double sum_enc = 0, sum_net = 0, sum_dec = 0, sum_all = 0;
+    double max_all = 0, max_net = 0;   // el promedio esconde justo el pico que rompe el pacing
+    double sum_snap = 0, max_snap = 0; // las copias no estaban dentro de la ventana medida
     unsigned samples = 0;
 };
-static const unsigned kMarks = 4;         // 0 inicio, 1 post-encode, 2 post-red, 3 post-decode
+static const unsigned kMarks = 6;         // 0 inicio, 1 post-encode, 2 post-red, 3 post-decode,
+                                          // 4/5 alrededor de las copias de entrada
 static const unsigned kPSlots = 4;        // rotacion para no leer lo que aun se ejecuta
 static Prof g_prof;
 static bool g_profiling = true;
@@ -169,7 +179,7 @@ static bool prof_init(ID3D12Device *dev) {
 }
 
 static inline void prof_mark(ID3D12GraphicsCommandList *cmd, unsigned m) {
-    if (!g_profiling || !g_prof.ready || cmd == nullptr) return;
+    if (!g_diagnostics || !g_profiling || !g_prof.ready || cmd == nullptr) return;
     cmd->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_prof.slot * kMarks + m);
 }
 
@@ -182,6 +192,7 @@ static void prof_resolve(ID3D12GraphicsCommandList *cmd) {
 }
 
 static void prof_report() {
+    if (!g_diagnostics) return;   // Map/Unmap per present is not free
     if (!g_profiling || !g_prof.ready || g_prof.freq == 0) return;
     // leer el slot mas viejo: ya se ejecuto seguro
     const unsigned old = (g_prof.slot + 1) % kPSlots;
@@ -189,21 +200,36 @@ static void prof_report() {
     void *p = nullptr;
     if (FAILED(g_prof.rb->Map(0, &r, &p)) || p == nullptr) return;
     const UINT64 *t = reinterpret_cast<const UINT64 *>(p) + old * kMarks;
-    if (t[3] > t[0] && t[0] != 0) {
+    static UINT64 last_t0 = 0;
+    if (t[3] > t[0] && t[0] != 0 && t[0] != last_t0) {   // no volver a contar el mismo slot
+        last_t0 = t[0];
         const double k = 1000.0 / (double)g_prof.freq;   // ticks -> ms
         g_prof.sum_enc += (double)(t[1] - t[0]) * k;
         g_prof.sum_net += (double)(t[2] - t[1]) * k;
         g_prof.sum_dec += (double)(t[3] - t[2]) * k;
-        g_prof.sum_all += (double)(t[3] - t[0]) * k;
+        const double all = (double)(t[3] - t[0]) * k;
+        const double net = (double)(t[2] - t[1]) * k;
+        g_prof.sum_all += all;
+        if (all > g_prof.max_all) g_prof.max_all = all;
+        if (net > g_prof.max_net) g_prof.max_net = net;
+        if (t[5] > t[4] && t[4] != 0) {
+            const double sn = (double)(t[5] - t[4]) * k;
+            g_prof.sum_snap += sn;
+            if (sn > g_prof.max_snap) g_prof.max_snap = sn;
+        }
         ++g_prof.samples;
     }
     D3D12_RANGE w{ 0, 0 }; g_prof.rb->Unmap(0, &w);
-    if (g_prof.samples >= 600) {
+    if (g_prof.samples >= 120) {
         const double n = (double)g_prof.samples;
-        logf("[NRPRE] PERFIL  encode=%.3f ms  red=%.3f ms  decode=%.3f ms  total=%.3f ms  (n=%u)",
+        logf("[NRPRE] PERFIL  encode=%.3f  red=%.3f  decode=%.3f  total=%.3f ms  | PICO red=%.3f total=%.3f ms  (n=%u)",
              g_prof.sum_enc / n, g_prof.sum_net / n, g_prof.sum_dec / n, g_prof.sum_all / n,
-             g_prof.samples);
+             g_prof.max_net, g_prof.max_all, g_prof.samples);
+        logf("[NRPRE] PERFIL  copias=%.3f ms  PICO copias=%.3f ms",
+             g_prof.sum_snap / n, g_prof.max_snap);
         g_prof.sum_enc = g_prof.sum_net = g_prof.sum_dec = g_prof.sum_all = 0;
+        g_prof.max_all = g_prof.max_net = 0;
+        g_prof.sum_snap = g_prof.max_snap = 0;
         g_prof.samples = 0;
     }
 }
@@ -233,6 +259,21 @@ static float g_effect_strength = 1.0f;  // blend back toward the game's own imag
 static float g_struct_gate  = 1.0f;     // delta allowed, relative to local contrast
 static float g_depth_reject = 0.02f;    // relative depth gap that reads as a disocclusion
 static float g_reproject = 1.0f;        // follow motion vectors when reusing the delta
+// How many frames old the stored delta is. The motion vector describes one frame of
+// movement, but above cadence 1 the delta can be two or three frames behind, and
+// following a single frame of motion then lands it short -- by more the faster the
+// camera moves and the higher the cadence. Scaling the step by the delta's age
+// assumes velocity held roughly constant across those frames, which is wrong under
+// hard acceleration but far closer than pretending the delta is one frame old.
+static unsigned g_delta_age = 1;
+// Scaling the step by the delta's age assumes the velocity held constant across
+// those frames. Under a turning camera it does not, and overshooting reads worse
+// than landing short -- so this is off, and a flat one-frame step is what ships.
+static bool g_delta_age_scale = false;
+// With advection on, the delta is carried forward every frame and is already in
+// position, so the apply pass samples it where it stands and the age multiplier is
+// not used at all. Off, the old behaviour returns: reproject by age, extrapolated.
+static bool g_delta_advect = false;   // measured worse than leaving the delta in place
 static float g_mv_scale_x = 1.0f, g_mv_scale_y = 1.0f;   // the game's own, captured live
 static float g_delta_clamp = 0.25f;     // cap in encoded units; 0 disables clamping
 static bool g_skip_passthrough = true;  // skipped frames pass the game's colour, not a stale one
@@ -274,6 +315,11 @@ static void codec_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Pi
                            ID3D12Resource *, ID3D12Resource *, ID3D12Resource *,
                            ID3D12Resource *, unsigned, unsigned,
                            ID3D12Resource * = nullptr, ID3D12Resource * = nullptr);
+static void advect_delta(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Resource *,
+                         ID3D12Resource *, ID3D12Resource *, unsigned, unsigned);
+static void snapshot_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *,
+                              ID3D12Resource *, ID3D12Resource *, DXGI_FORMAT,
+                              unsigned, unsigned);
 static void uav_barrier(ID3D12GraphicsCommandList *, ID3D12Resource *);
 static void barrier_transition(ID3D12GraphicsCommandList *, ID3D12Resource *,
                                D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES);
@@ -325,6 +371,37 @@ static float g_local_tone = 0.15f;
 static float g_local_structure = 0.70f;
 static float g_skin_structure = -1.0f;  // -1 = leave to the network
 static int   g_style = 0;
+// The network is 4.9 ms of the 8.9 ms frame -- 56% of the budget, measured, and
+// at cadence 2 it lands on every other frame, so the rendered interval swings
+// 8.9/13.9 ms and DLSS-G cannot pace through that. The feature already carries a
+// scaling knob; if it means what it says, running the net below render resolution
+// cuts the cost by area and the delta -- which is low frequency, and already
+// sampled bilinearly -- is the right thing to compute coarsely. 1.0 keeps today's
+// behaviour exactly; try 0.6 and watch PERFIL's red= before trusting it.
+static float g_net_scale = 1.0f;
+// Stage 1 of taking the network off the critical path: it reads our own copies of
+// Color/Depth/MVec instead of the game's textures, still on the graphics queue and
+// still in order. That settles the two unknowns -- whether the copies come out
+// right for a typeless depth buffer, and whether the network is happy reading
+// them -- before any second queue exists to hang on. Off by default.
+// Stage 1 validated that the network reads our copies correctly, which is what
+// stage 2 needed to know. Without stage 2 the network still runs in order on the
+// graphics queue and can read the game's textures directly, so the three copies
+// buy nothing and cost 0.07 ms a frame. Off until there is a second queue to feed.
+static bool g_async_net = false;
+static int  g_stall_ms = 120;   // F8: matches the >100 ms frames Streamline reports
+// Above cadence 1 the image alternates between two ways of being built: the frame
+// that runs the network gets its output developed directly, the frames between get
+// the stored effect reprojected onto them. Those two do not land in the same place
+// once anything moves, and a difference that alternates every frame is a flicker --
+// which is exactly what is left in Balanced and Performance.
+//
+// So stop giving one frame in N the special treatment. Build *every* frame the
+// same way, from the stored delta, and let the network's fresh result only ever
+// arrive as the next frame's delta. The reconstruction is then uniform: what varies
+// is how old the delta is, and that is a far smaller difference than which of two
+// different paths drew the frame.
+static bool g_uniform_delta = true;
 
 // ---- exposure read over a dedicated COPY queue ----------------------------
 // On a COPY queue D3D12 treats every resource as COMMON, so a copy needs no
@@ -399,7 +476,8 @@ static void exp_queue_tick(ID3D12Device *dev, ID3D12CommandQueue *gfx) {
                 break;
             }
             if ((g_pw_updates % 40) == 0)
-                logf("[NRPRE] exposure read: %.6f -> paper white %.4f", e, e > 1e-5f ? 1.0f / e : 0.0f);
+                if (g_diagnostics)
+                    logf("[NRPRE] exposure read: %.6f -> paper white %.4f", e, e > 1e-5f ? 1.0f / e : 0.0f);
             D3D12_RANGE w{ 0, 0 }; g_eq.readback->Unmap(0, &w);
             // Measured on GTA V: the value rises as the scene darkens (day ~2.4-3.8,
             // night ~11.3), so it is the exposure gain the game applies to reach
@@ -491,6 +569,13 @@ struct Codec {
     ID3D12RootSignature *root = nullptr;
     ID3D12PipelineState *pso_enc = nullptr, *pso_dec = nullptr;
     ID3D12PipelineState *pso_delta = nullptr, *pso_apply = nullptr;
+    // Private copies of the game's Color/Depth/MVec. See CSSnapshot: the network
+    // cannot keep reading the game's own textures once it stops running in order
+    // on the graphics queue, because those are being redrawn for the next frame.
+    ID3D12PipelineState *pso_snap = nullptr, *pso_advect = nullptr;
+    ID3D12Resource *delta2 = nullptr;   // ping-pong: advection cannot read and write one texture
+    ID3D12Resource *snap_color = nullptr, *snap_depth = nullptr, *snap_mv = nullptr;
+    bool snap_ready = false;
     ID3D12DescriptorHeap *heap = nullptr;
     ID3D12Resource *proxy = nullptr, *final_tex = nullptr;
     ID3D12Resource *delta = nullptr;      // what the network added, reused on skipped frames
@@ -510,7 +595,12 @@ struct Codec {
     bool ready = false;
 } g_cx;
 
-static const unsigned kCxSlots = 8;      // descriptors per slot: t0..t4, u0, u1
+// The ring has to outlast the frames the CPU runs ahead of the GPU: a slot reused
+// while its dispatch is still in flight hands the shader another frame's views.
+// Eight was already only ~2.7 frames of headroom at three dispatches a frame, and
+// the snapshot path takes it to six a frame -- 1.3 frames, which corrupts reliably.
+// The heap is kCxSlots * 7 descriptors and nothing else, so this is cheap.
+static const unsigned kCxSlots = 64;     // descriptors per slot: t0..t4, u0, u1
 
 // These two return a struct by value: MSVC uses the hidden-sret convention that
 // MinGW does not match, so call them through the vtable explicitly.
@@ -577,6 +667,20 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
              err ? (const char *)err->GetBufferPointer() : "");
         return false;
     }
+    // Optional: without it only the async path is unavailable, so a failure here
+    // must not take the whole codec down with it.
+    ID3DBlob *adv_cs = nullptr;
+    HRESULT hadv = D3DCompileFn(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                                "CSAdvect", "cs_5_0", 0, 0, &adv_cs, &err);
+    if (FAILED(hadv))
+        logf("[NRPRE] codec: CSAdvect failed 0x%08lX (delta will age in place)",
+             (unsigned long)hadv);
+    ID3DBlob *snap_cs = nullptr;
+    HRESULT hsnap = D3DCompileFn(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                                 "CSSnapshot", "cs_5_0", 0, 0, &snap_cs, &err);
+    if (FAILED(hsnap))
+        logf("[NRPRE] codec: CSSnapshot failed 0x%08lX (async path unavailable)",
+             (unsigned long)hsnap);
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -635,6 +739,19 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_delta)))) {
         logf("[NRPRE] codec: delta PSO failed"); return false;
     }
+    if (adv_cs != nullptr) {
+        pd.CS.pShaderBytecode = adv_cs->GetBufferPointer();
+        pd.CS.BytecodeLength  = adv_cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_advect))))
+            logf("[NRPRE] codec: advect PSO failed");
+    }
+    // snapshot: same root signature, its own PSO
+    if (snap_cs != nullptr) {
+        pd.CS.pShaderBytecode = snap_cs->GetBufferPointer();
+        pd.CS.BytecodeLength  = snap_cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_snap))))
+            logf("[NRPRE] codec: snapshot PSO failed (async path unavailable)");
+    }
     pd.CS.pShaderBytecode = apl->GetBufferPointer(); pd.CS.BytecodeLength = apl->GetBufferSize();
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_apply)))) {
         logf("[NRPRE] codec: apply PSO failed"); return false;
@@ -683,6 +800,7 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     g_cx.final_tex = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
     // signed: the delta is a difference and goes negative wherever NR darkens
     g_cx.delta = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    g_cx.delta2 = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
     g_cx.ready = (g_cx.proxy && g_cx.final_tex && g_cx.delta);
     logf("[NRPRE] codec: ready=%d proxy=%p final=%p", (int)g_cx.ready,
          (void *)g_cx.proxy, (void *)g_cx.final_tex);
@@ -856,6 +974,90 @@ static ID3D12Resource *make_uav_tex(ID3D12Device *dev, unsigned w, unsigned h, D
 
 static bool g_setup_done = false;
 
+// Every diagnostic in here is capped to the first handful of frames, so by the
+// time anything goes wrong the logging has already stopped and the log says
+// nothing at all about the moment that matters. These are the two results that
+// can turn an evaluate into garbage on screen -- the network's own, and DLSS's --
+// and until now a failure in either was silent after frame five. Count them for
+// the whole session and say so the first times and then periodically: a flash
+// that lines up with a failure is a different problem from one that does not.
+static unsigned g_er_fail = 0, g_gr_fail = 0, g_pass_frames = 0;
+static unsigned long long g_ev_total = 0;
+
+// F10 marks the log *after* the event, and nobody reacts inside a frame -- by the
+// time the key goes down the flash is several frames gone. So record every
+// evaluate into a small ring and have F10 dump what came *before* it: at roughly
+// 240 evaluates a second, 1024 slots hold about four seconds, which is far more
+// than any human delay. The same dump fires by itself on the first few NGX
+// failures, so the interesting case needs no key at all.
+struct EvRec {
+    unsigned long long tick;
+    double t;                 // wall clock, so a dump lines up with sl.log
+    const void *feed, *src;
+    unsigned er, gr;
+    unsigned short w, h;
+    unsigned char run, codec, fvalid, dvalid, pass, skip;
+};
+static EvRec g_ring[1024];
+static volatile LONG g_ring_seq = 0;
+
+static void ring_push(unsigned long long tick, const void *feed, const void *src,
+                      unsigned er, unsigned gr, unsigned w, unsigned h,
+                      bool run, bool codec, bool fvalid, bool dvalid, bool pass)
+{
+    if (!g_diagnostics) return;   // nothing reads it unless F10 is going to be pressed
+    const LONG i = InterlockedIncrement(&g_ring_seq) - 1;
+    EvRec &r = g_ring[(unsigned)i & 1023u];
+    r.tick = tick; r.feed = feed; r.src = src; r.er = er; r.gr = gr;
+    SYSTEMTIME st; GetLocalTime(&st);
+    r.t = st.wHour * 3600.0 + st.wMinute * 60.0 + st.wSecond + st.wMilliseconds / 1000.0;
+    r.w = (unsigned short)w; r.h = (unsigned short)h;
+    r.run = run; r.codec = codec; r.fvalid = fvalid; r.dvalid = dvalid;
+    r.pass = pass; r.skip = (unsigned char)g_skip_n;
+}
+
+// The first version of this wrote 1024 lines through ReShade's logger, which locks
+// and flushes per message, on the present thread. That stalled the frame hard
+// enough to *produce* the very artefact it was meant to catch -- the instrument was
+// perturbing the experiment. Build the whole text in memory and put it on disk in
+// one write, to a file of our own, so observing costs about as much as one log line.
+static void ring_dump(const char *why)
+{
+    const LONG end = g_ring_seq;
+    const LONG start = (end > 1024) ? end - 1024 : 0;
+    static char *buf = nullptr;
+    static const size_t kCap = 1024u * 224u;
+    if (buf == nullptr) buf = static_cast<char *>(std::malloc(kCap));
+    if (buf == nullptr) return;
+    size_t o = 0;
+    o += (size_t)std::snprintf(buf + o, kCap - o,
+                               "==== %s: %ld evaluates hasta el #%ld ====\r\n",
+                               why, (long)(end - start), (long)end);
+    for (LONG i = start; i < end && o + 256 < kCap; ++i) {
+        const EvRec &r = g_ring[(unsigned)i & 1023u];
+        o += (size_t)std::snprintf(buf + o, kCap - o,
+                 "R %6ld %02d:%02d:%06.3f tick=%llu run=%d cad=%d codec=%d fvalid=%d dvalid=%d pass=%d "
+                 "%ux%u feed=%p src=%p er=0x%08X gr=0x%08X\r\n",
+                 (long)i, (int)(r.t / 3600), (int)((r.t / 60)) % 60, r.t - ((long long)(r.t / 60)) * 60.0,
+                 (unsigned long long)r.tick, (int)r.run, (int)r.skip, (int)r.codec,
+                 (int)r.fvalid, (int)r.dvalid, (int)r.pass, (unsigned)r.w, (unsigned)r.h,
+                 r.feed, r.src, r.er, r.gr);
+    }
+    HANDLE h = CreateFileW(L"nrpre-ring.txt", FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        SetFilePointer(h, 0, nullptr, FILE_END);
+        WriteFile(h, buf, (DWORD)o, &wrote, nullptr);
+        CloseHandle(h);
+    }
+    logf("[NRPRE] anillo volcado a nrpre-ring.txt (%s, %ld entradas)",
+         why, (long)(end - start));
+}
+
+
+
+
 // One trampoline per module we hook. Which module is the live one cannot be told
 // apart by inspection -- an NGX proxy and the driver both export the same entry
 // point and both stay loaded -- so rather than guess, hook every module that
@@ -875,14 +1077,17 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
     {   // heartbeat: proves whether the hook survives a device/swapchain recreation
         static unsigned long long hb = 0;
         if ((hb++ % 60ull) == 0ull)
+            if (g_diagnostics)
             logf("[NRPRE] HB #%llu handle=%p | pw=%.4f meas=%.4f valid=%d upd=%u "
                  "| hdr=%u det=%d knee=%.3f kmeas=%.3f | expfresh=%u fromgame=%d "
-                 "| net=%ux%u finalvalid=%d",
+                 "| net=%ux%u finalvalid=%d | cad=%d async=%d | erfail=%u grfail=%u passthru=%u",
                  (unsigned long long)hb, (void *)g_nr_handle,
                  g_paper_white, g_pw_measured, (int)g_pw_valid, g_pw_updates,
                  g_hdr_mode, (int)g_hdr_detected, g_knee, g_knee_measured,
                  g_exp_fresh, (int)g_exp_from_game,
-                 g_net_w, g_net_h, (int)g_final_valid);
+                 g_net_w, g_net_h, (int)g_final_valid,
+                 g_skip_n, (int)g_async_net,   // which mode was actually running, always
+                 g_er_fail, g_gr_fail, g_pass_frames);
     }
     if (params != nullptr && (g_logged < 12 || !g_setup_done)) {
         if (g_logged == 0) probe_slots(params, NVSDK_NGX_Parameter_Color);
@@ -939,9 +1144,42 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         ID3D12Resource      *in  = hi ? dst_col        : src;
 
         if (in && dep && mv) {
-            pset_res(pp, "DLSSNR.Color",  in);
-            pset_res(pp, "DLSSNR.Depth",  dep);
-            pset_res(pp, "DLSSNR.MVec",   mv);
+            ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
+            if (g_async_net && g_cx.pso_snap != nullptr && dep != nullptr && mv != nullptr) {
+                if (!g_cx.snap_ready) {
+                    g_cx.snap_color = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                    g_cx.snap_depth = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R32_FLOAT);
+                    g_cx.snap_mv    = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R16G16_FLOAT);
+                    g_cx.snap_ready = (g_cx.snap_color && g_cx.snap_depth && g_cx.snap_mv);
+                    logf("[NRPRE] snapshot: %ux%u ready=%d", w_net, h_net, (int)g_cx.snap_ready);
+                }
+                if (g_cx.snap_ready) {
+                    prof_mark(cmd, 4);
+                    snapshot_dispatch(cmd, g_device, in,  g_cx.snap_color,
+                                      DXGI_FORMAT_R16G16B16A16_FLOAT, w_net, h_net);
+                    snapshot_dispatch(cmd, g_device, dep, g_cx.snap_depth,
+                                      DXGI_FORMAT_R32_FLOAT, w_net, h_net);
+                    snapshot_dispatch(cmd, g_device, mv,  g_cx.snap_mv,
+                                      DXGI_FORMAT_R16G16_FLOAT, w_net, h_net);
+                    uav_barrier(cmd, g_cx.snap_color);
+                    uav_barrier(cmd, g_cx.snap_depth);
+                    uav_barrier(cmd, g_cx.snap_mv);
+                    // the network reads them the way it reads the game's own
+                    barrier_transition(cmd, g_cx.snap_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    barrier_transition(cmd, g_cx.snap_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    barrier_transition(cmd, g_cx.snap_mv,    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    prof_mark(cmd, 5);
+                    net_color = g_cx.snap_color;
+                    net_depth = g_cx.snap_depth;
+                    net_mv    = g_cx.snap_mv;
+                }
+            }
+            pset_res(pp, "DLSSNR.Color",  net_color);
+            pset_res(pp, "DLSSNR.Depth",  net_depth);
+            pset_res(pp, "DLSSNR.MVec",   net_mv);
             // Forward the game's own motion-vector scale instead of assuming 1.0:
             // a wrong scale makes the network reproject onto the wrong pixels,
             // which shows up as smearing and dirty edges in motion.
@@ -1087,24 +1325,54 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     pset_res(pp, "DLSSNR.Color", in);
                 }
 
-                for (int k = 0; k < g_repeat; ++k)
+                // The braces are load-bearing: without them the loop covered only the
+                // first mark and the evaluate ran once regardless of g_repeat.
+                for (int k = 0; k < g_repeat; ++k) {
                     prof_mark(cmd, 1);
                     er = g_snip_eval(cmd, hh, pp, nullptr);
                     prof_mark(cmd, 2);
+                }
+                if (g_async_net && g_cx.snap_ready) {
+                    // back to UAV so the next frame's snapshot can write them again
+                    barrier_transition(cmd, g_cx.snap_color,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    barrier_transition(cmd, g_cx.snap_depth,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    barrier_transition(cmd, g_cx.snap_mv,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
                 ++g_eval_count;
                 g_reset_pending = false;   // the network has now seen it
 
                 if (use_codec) {
                     barrier_transition(cmd, out, kUAV, kSRV);          // decode reads NR output
-                    codec_dispatch(cmd, g_device, g_cx.pso_dec, in, g_cx.proxy, out,
-                                   g_cx.final_tex, w_net, h_net);
-                    uav_barrier(cmd, g_cx.final_tex);
+                    // Uniform mode: this frame is developed from the delta that is
+                    // already stored, exactly as the frames between are, so no frame
+                    // is built differently from its neighbours. The result the
+                    // network just produced becomes the *next* frame's delta, below.
+                    // Needs a delta to exist, so the first run frame still decodes.
+                    const bool uniform = g_uniform_delta && g_delta_reuse
+                                      && g_delta_valid && g_skip_n > 1;
+                    if (uniform) {
+                        if (g_delta_advect)
+                            advect_delta(cmd, g_device, in, mv, dep, w_net, h_net);
+                        barrier_transition(cmd, g_cx.delta, kUAV, kSRV);
+                        codec_dispatch(cmd, g_device, g_cx.pso_apply, in, g_cx.proxy,
+                                       g_cx.delta, g_cx.final_tex, w_net, h_net, mv, dep);
+                        uav_barrier(cmd, g_cx.final_tex);
+                        barrier_transition(cmd, g_cx.delta, kSRV, kUAV);
+                    } else {
+                        codec_dispatch(cmd, g_device, g_cx.pso_dec, in, g_cx.proxy, out,
+                                       g_cx.final_tex, w_net, h_net);
+                        uav_barrier(cmd, g_cx.final_tex);
+                    }
                     // Capture what the network changed, while both inputs are still SRV.
                     if (g_delta_reuse && g_skip_n > 1) {
                         codec_dispatch(cmd, g_device, g_cx.pso_delta, in, g_cx.proxy, out,
                                        g_cx.delta, w_net, h_net, nullptr, dep);
                         uav_barrier(cmd, g_cx.delta);
                         g_delta_valid = true;
+                        g_delta_age = 1;   // fresh again
                     }
                     barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);   // restore for next frame
                     barrier_transition(cmd, out,        kSRV, kUAV);
@@ -1120,6 +1388,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                g_cx.proxy, w_net, h_net);
                 uav_barrier(cmd, g_cx.proxy);
                 barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);
+                if (g_delta_advect) advect_delta(cmd, g_device, in, mv, dep, w_net, h_net);
                 barrier_transition(cmd, g_cx.delta, kUAV, kSRV);
                 codec_dispatch(cmd, g_device, g_cx.pso_apply, in, g_cx.proxy, g_cx.delta,
                                g_cx.final_tex, w_net, h_net, mv, dep);
@@ -1127,6 +1396,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);
                 barrier_transition(cmd, g_cx.delta, kSRV, kUAV);
                 g_final_valid = true;
+                if (g_delta_age < 8) ++g_delta_age;   // one more frame behind
             }
 
             // --- 2d: hand the processed image to the game's DLSS as its colour input.
@@ -1140,13 +1410,32 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // costs the NR look on that frame but keeps the input aligned.
             ID3D12Resource *feed = use_codec ? (g_final_valid ? g_cx.final_tex : nullptr) : out;
             const bool delta_fed = use_codec && g_delta_reuse && g_delta_valid && g_skip_n > 1;
-            if (!run_now && g_skip_passthrough && !delta_fed)
+            // !run_now covers two different situations and they need opposite
+            // answers. One is a frame the cadence genuinely skipped. The other is a
+            // *repeat* evaluate of the frame we just processed -- the game issues
+            // more than one per frame and only the first claims it -- and there
+            // final_tex already holds this very frame, current and enhanced.
+            // Passing the raw colour on a repeat threw the work away on 43% of
+            // evaluates here, leaving whether the effect is seen at all depending on
+            // which evaluate's output reached the screen.
+            const bool repeat_of_this_frame = !first_of_frame && g_final_valid;
+            if (!run_now && !repeat_of_this_frame && g_skip_passthrough && !delta_fed) {
                 feed = nullptr;                                   // let src go through untouched
+                ++g_pass_frames;   // the effect is fully off on this frame: count it
+            }
             if (g_rebind && !hi && feed != nullptr) {
                 barrier_transition(cmd, feed, kUAV, kSRV);
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, feed);
                 NVSDK_NGX_Result gr = t_orig_eval(cmd, feat, params, cb);
+                if (gr != NVSDK_NGX_Result_Success) {
+                    ++g_gr_fail;
+                    if (g_gr_fail <= 3) ring_dump("fallo del evaluate de DLSS");
+                    if (g_gr_fail <= 20 || (g_gr_fail % 200) == 0)
+                        logf("[NRPRE] *** DLSS Evaluate FAILED -> 0x%08X  (fallo #%u, tick %llu, feed=%p run=%d)",
+                             (unsigned)gr, g_gr_fail, (unsigned long long)tick,
+                             (void *)feed, (int)run_now);
+                }
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, src);
                 barrier_transition(cmd, feed, kSRV, kUAV);
@@ -1166,6 +1455,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                          (int)use_codec, (int)run_now, (unsigned)gr);
                     ++g_eval_logged;
                 }
+                ring_push(tick, feed, src, (unsigned)er, (unsigned)gr, w_net, h_net,
+                          run_now, use_codec, g_final_valid, g_delta_valid, false);
                 return gr;
             }
             if (g_diag_frames > 0) {
@@ -1174,7 +1465,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                      (unsigned long long)tick, (int)run_now, g_skip_n, (int)use_codec,
                      (int)g_final_valid, (void *)feed);
             }
-            if (g_eval_logged < 5) {
+            ring_push(tick, feed, src, (unsigned)er, 0u, w_net, h_net,
+                      run_now, use_codec, g_final_valid, g_delta_valid, feed == nullptr);
+            if (er != NVSDK_NGX_Result_Success) {
+                ++g_er_fail;
+                if (g_er_fail <= 3) ring_dump("fallo del evaluate de la red");
+                if (g_er_fail <= 20 || (g_er_fail % 200) == 0)
+                    logf("[NRPRE] *** NR Evaluate(%s) FAILED -> 0x%08X  (fallo #%u, tick %llu, run=%d codec=%d net=%ux%u)",
+                         hi ? "HI" : "LO", (unsigned)er, g_er_fail,
+                         (unsigned long long)tick, (int)run_now, (int)use_codec, w_net, h_net);
+            } else if (g_eval_logged < 5) {
                 logf("[NRPRE] 2c: NR Evaluate(%s) -> 0x%08X", hi ? "HI" : "LO", (unsigned)er);
                 ++g_eval_logged;
             }
@@ -1398,7 +1698,8 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
 
     pset_u(g_nr_params, "DLSSNR.Hint.Render.Preset", 0);
     pset_u(g_nr_params, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
-    pset_f(g_nr_params, "DLSSNR.ScalingRatio", 1.0f); // same resolution in and out
+    pset_f(g_nr_params, "DLSSNR.ScalingRatio", g_net_scale);
+    logf("[NRPRE] 2b: ScalingRatio=%.3f (1.0 = misma resolucion dentro y fuera)", g_net_scale);
     pset_u(g_nr_params, "DLSSNR.UseAutoMask", g_auto_mask ? 1u : 0u);
     pset_u(g_nr_params, "DLSSNR.Style", (unsigned)g_style);
     pset_u(g_nr_params, "CreationNodeMask", 1);
@@ -1544,7 +1845,11 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     struct { UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
              float mvx, mvy, reproj, dreject, sgate, strength, chroma, pad4; } k{
         w, h, pw_effective, g_transfer, g_color_strength, hdr_mode, g_knee, g_delta_clamp,
-        g_mv_scale_x, g_mv_scale_y, g_reproject, g_depth_reject, g_struct_gate,
+        g_mv_scale_x, g_mv_scale_y,
+        // advected: it is already in place, so do not move it again
+        (g_delta_advect && g_cx.pso_advect) ? 0.0f
+            : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
+        g_depth_reject, g_struct_gate,
         g_effect_strength, g_chroma_transfer, 0.0f };
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
@@ -1555,6 +1860,88 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
     cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
 }
+
+// One texture into one of our own, with the UAV typed for the destination.
+//
+// codec_dispatch cannot serve here: it hardcodes an RGBA16F UAV, which is right
+// for colour and wrong for a single-channel depth or a two-channel motion vector.
+// Everything else -- the ring slot, the root signature, the SRV format mapping --
+// is deliberately the same, so this stays one small departure and not a fork.
+static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
+                              ID3D12Resource *srcTex, ID3D12Resource *dstTex,
+                              DXGI_FORMAT uav_fmt, unsigned w, unsigned h)
+{
+    if (cmd == nullptr || dev == nullptr || srcTex == nullptr || dstTex == nullptr) return;
+    if (g_cx.pso_snap == nullptr || g_cx.heap == nullptr) return;
+    const unsigned slot = g_cx.slot;
+    g_cx.slot = (g_cx.slot + 1) % kCxSlots;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
+    cpu.ptr += (SIZE_T)slot * 7 * g_cx.inc;
+    gpu.ptr += (UINT64)slot * 7 * g_cx.inc;
+
+    D3D12_RESOURCE_DESC sd0{};
+    DXGI_FORMAT srv_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (res_desc(srcTex, &sd0)) {
+        switch (sd0.Format) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS:    srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        case DXGI_FORMAT_R24G8_TYPELESS:       srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;    break;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:    srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;    break;
+        case DXGI_FORMAT_R32_TYPELESS:         srv_fmt = DXGI_FORMAT_R32_FLOAT;                break;
+        case DXGI_FORMAT_D32_FLOAT:            srv_fmt = DXGI_FORMAT_R32_FLOAT;                break;
+        case DXGI_FORMAT_D16_UNORM:            srv_fmt = DXGI_FORMAT_R16_UNORM;                break;
+        case DXGI_FORMAT_R16_TYPELESS:         srv_fmt = DXGI_FORMAT_R16_UNORM;                break;
+        default:                               srv_fmt = sd0.Format;                           break;
+        }
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    sd.Format = srv_fmt;
+    for (int i = 0; i < 5; ++i) {            // t1..t4 unused, but must be valid
+        D3D12_CPU_DESCRIPTOR_HANDLE hnd = cpu; hnd.ptr += (SIZE_T)i * g_cx.inc;
+        dev->CreateShaderResourceView(srcTex, &sd, hnd);
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+    ud.Format = uav_fmt;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    D3D12_CPU_DESCRIPTOR_HANDLE uh = cpu; uh.ptr += (SIZE_T)5 * g_cx.inc;
+    dev->CreateUnorderedAccessView(dstTex, nullptr, &ud, uh);
+    D3D12_CPU_DESCRIPTOR_HANDLE uh1 = cpu; uh1.ptr += (SIZE_T)6 * g_cx.inc;
+    dev->CreateUnorderedAccessView(dstTex, nullptr, &ud, uh1);
+
+    struct { UINT w, h; float f[14]; } k{}; k.w = w; k.h = h;
+    ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetComputeRootSignature(g_cx.root);
+    cmd->SetPipelineState(g_cx.pso_snap);
+    cmd->SetComputeRootDescriptorTable(0, gpu);
+    cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
+    cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+}
+
+// Move the stored delta forward one frame, so it is never reused out of position.
+// Reads the current delta, writes the moved one into the spare, then swaps: a
+// compute shader cannot read and write the same texture safely, and the swap costs
+// nothing since only the pointers move.
+static void advect_delta(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
+                         ID3D12Resource *in_tex, ID3D12Resource *mvec,
+                         ID3D12Resource *depth, unsigned w, unsigned h)
+{
+    if (g_cx.pso_advect == nullptr || g_cx.delta2 == nullptr) return;
+    barrier_transition(cmd, g_cx.delta, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    codec_dispatch(cmd, dev, g_cx.pso_advect, in_tex, nullptr, g_cx.delta,
+                   g_cx.delta2, w, h, mvec, depth);
+    uav_barrier(cmd, g_cx.delta2);
+    barrier_transition(cmd, g_cx.delta, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource *t = g_cx.delta; g_cx.delta = g_cx.delta2; g_cx.delta2 = t;
+}
+
+
 
 static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
     D3D12_RESOURCE_BARRIER b{};
@@ -1570,6 +1957,14 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 static void load_settings(reshade::api::effect_runtime *rt) {
     int v = 0; float f = 0.0f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))       g_nr_enabled = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "AsyncNetwork", v)) g_async_net = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "StallMs", v)) g_stall_ms = (v < 1 ? 1 : (v > 500 ? 500 : v));
+    if (reshade::get_config_value(rt, "NRPreUpscale", "UniformDelta", v)) g_uniform_delta = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Diagnostics", v)) g_diagnostics = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAdvect", v)) g_delta_advect = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAgeScale", v)) g_delta_age_scale = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "NetScale", f))
+        g_net_scale = (f < 0.25f ? 0.25f : (f > 1.0f ? 1.0f : f));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Cadence", v))       g_skip_n = (v < 1 ? 1 : (v > 3 ? 3 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         g_codec_on = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoMask", v)) g_auto_mask = (v != 0);
@@ -1624,6 +2019,12 @@ static void apply_preset(int p) {
 static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_nr_enabled ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
+    reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
+    reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "Diagnostics", g_diagnostics ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "DeltaAdvect", g_delta_advect ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "DeltaAgeScale", g_delta_age_scale ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "SkipPassthrough", g_skip_passthrough ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "DeltaReuse", g_delta_reuse ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "DeltaClamp", g_delta_clamp);
@@ -2045,7 +2446,10 @@ static void release_state(const char *why) {
     rls(g_nr_out); rls(g_nr_out_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     rls(g_cx.heap); rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);
-    rls(g_cx.pso_hist); rls(g_cx.pso_delta); rls(g_cx.pso_apply);
+    rls(g_cx.pso_hist); rls(g_cx.pso_delta); rls(g_cx.pso_apply); rls(g_cx.pso_snap);
+    rls(g_cx.pso_advect); rls(g_cx.delta2);
+    rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
+    g_cx.snap_ready = false;
     rls(g_cx.root); rls(g_cx.fence);
     g_cx.ready = false; g_cx.pending = false; g_cx.copy_recorded = false;
     g_cx.slot = 0; g_cx.fence_val = 0; g_cx.pending_at = 0;
@@ -2064,6 +2468,36 @@ static void release_state(const char *why) {
 }
 
 static bool g_hooked = false;
+
+// Frame generation exports the same evaluate, and hooking it wrecks the cadence.
+//
+// A frame is claimed by an unconditional swap of the DLSS jitter key, which is
+// right for as long as every evaluate reaching it belongs to the upscaler: the
+// game issues its evaluates for one frame with one jitter, so the first wins and
+// the rest do not. A DLSS-G evaluate carries no such jitter, enters with the zero
+// key, overwrites the real one and comes back "first" -- claiming a frame that
+// does not exist. At (N+1)x there are N of those per rendered frame.
+//
+// Cadence 1 survives it, because a claim only decides whether to run the network
+// and it runs on every frame anyway. Above 1 the claim decides *which* frames run
+// and which are reconstructed, so the false ones scramble the pattern and the
+// effect lands on the wrong frames -- which is why the artefact grows with both
+// the multiplier and the cadence.
+//
+// There was never anything here to hook: frame generation runs after the upscaler,
+// on an image this add-on has already been applied to. Skip it by name.
+static bool is_framegen_snippet(HMODULE m) {
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(m, path, MAX_PATH) == 0) return false;
+    for (wchar_t *p = path; *p; ++p)
+        if (*p >= L'A' && *p <= L'Z') *p += 32;
+    for (const wchar_t *p = path; *p; ++p) {
+        const wchar_t *n = L"dlssg", *q = p;
+        while (*n && *q == *n) { ++q; ++n; }
+        if (!*n) return true;
+    }
+    return false;
+}
 
 static void install_hook() {
     if (g_hooked) return;
@@ -2091,6 +2525,7 @@ static void install_hook() {
             bool dup = false;
             for (unsigned k = 0; k < n; ++k) dup |= (cands[k] == mods[i]);
             if (dup) continue;
+            if (is_framegen_snippet(mods[i])) continue;      // see above
             if (GetProcAddress(mods[i], "NVSDK_NGX_D3D12_EvaluateFeature")) cands[n++] = mods[i];
         }
     }
@@ -2184,9 +2619,30 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
              g_hdr_mode, (int)g_hdr_detected, g_knee, g_exp_fresh, (int)g_exp_from_game,
              g_skip_n, g_net_w, g_net_h, (int)g_final_valid, (int)g_codec_on,
              (int)g_nr_enabled, g_phase);
+        ring_dump("F10");   // what came BEFORE the key: no one reacts inside a frame
         g_jit_burst = 40;
     }
     mark_prev = mark_down;
+
+    // Control for the F10 observation: the dump made the artefact appear, and the
+    // only thing it did was block this thread. Reproduce the block by itself --
+    // no logging, no state touched, nothing but time -- and see whether the
+    // artefact still comes. If it does, the artefact is a pacing failure and not
+    // anything this add-on draws.
+    static bool stall_prev = false;
+    const bool stall_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (stall_down && !stall_prev) {
+        LARGE_INTEGER f, t0, t1;
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        // Streamline reports the real events as frames over 100 ms, so reproduce
+        // that length, not a token pause. If this brings the black flash on with
+        // the add-on disabled, the flash is simply what a hitch of that size looks
+        // like at 4x, and NR's only part in it is making hitches more likely.
+        const long long target = f.QuadPart * g_stall_ms / 1000;
+        do { QueryPerformanceCounter(&t1); } while (t1.QuadPart - t0.QuadPart < target);
+        logf("[NRPRE] F8: %d ms de stall en el hilo de presentacion, sin I/O", g_stall_ms);
+    }
+    stall_prev = stall_down;
 
     static bool ph_prev = false;
     const bool ph_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
@@ -2197,6 +2653,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     }
     ph_prev = ph_down;
 
+    prof_report();   // estaba definido y nunca se llamaba: nunca hubo una linea PERFIL
     frame_tick();
     // Signal here, not in the eval hook: only at present has the game actually
     // submitted the command list the histogram copy was recorded into.
@@ -2204,6 +2661,13 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         queue->get_device()->get_api() == reshade::api::device_api::d3d12)
     {
         auto *gq = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
+        // g_prof.freq was declared and never assigned, so prof_report() bailed on
+        // its first line even once it was being called. The queue is the only thing
+        // that knows the tick rate, and this is the first place we hold one.
+        if (g_prof.ready && g_prof.freq == 0) {
+            if (SUCCEEDED(gq->GetTimestampFrequency(&g_prof.freq)))
+                logf("[NRPRE] perfilador: %llu ticks/s", (unsigned long long)g_prof.freq);
+        }
         tick_exposure(gq);
         exp_queue_tick(g_device, gq);
     }

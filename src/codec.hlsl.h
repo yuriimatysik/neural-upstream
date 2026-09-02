@@ -126,7 +126,13 @@ void CSDecode(uint3 tid : SV_DispatchThreadID) {
   const float pw = max(PaperWhiteScale, 1e-4);
   float3 original = max(src.rgb, 0.0);
   float3 proxy    = SrgbDecode(Proxy.Load(int3(tid.xy, 0)).rgb);
-  float3 neural   = SrgbDecode(Neural.Load(int3(tid.xy, 0)).rgb);
+  // saturate() is not cosmetic. CSApplyDelta clamps its reconstructed
+  // neural_enc to [0,1]; without the same clamp here the two paths disagree
+  // wherever the encoded value passes 1.0 -- the highlights, on HDR content.
+  // At any cadence above 1 those two paths alternate frame by frame, so a
+  // difference that exists on only one of them reads as flicker, on exactly
+  // the pixels the eye is drawn to. Clip both or clip neither.
+  float3 neural   = SrgbDecode(saturate(Neural.Load(int3(tid.xy, 0)).rgb));
   if (HdrMode == 2) { proxy *= pw; neural *= pw; }
   float3 result = RestoreRange(original, proxy, neural);
   const float luma_only = Luminance(result);
@@ -158,6 +164,23 @@ void CSDelta(uint3 tid : SV_DispatchThreadID) {
 // so geometry and motion stay correct and only the enhancement is a frame old.
 // Clamping bounds how wrong it can be where the delta no longer fits the scene,
 // such as at a disocclusion or a sudden lighting change.
+// What to do on a skipped frame when this pixel's history cannot be reprojected.
+// Falling back to the game's own colour costs the pixel the effect for one frame
+// while its neighbours keep it, and the next frame hands it back: a
+// full-amplitude blink, on exactly the pixels motion has just uncovered. That is
+// what the flicker is made of, and it is why it tracks movement. A delta that is
+// stale in *position* is far less visible than an effect that switches off, so
+// reuse the one stored at this pixel and trust it only as far as the depth it was
+// captured at still matches this frame's.
+float3 DeltaInPlace(uint2 px) {
+  const float4 here = Neural.Load(int3(px, 0));
+  const float  dcur = DepthTex.Load(int3(px, 0)).x;
+  const float  tol  = max(DepthReject, 0.0);
+  const float  ref  = max(abs(dcur), 1e-6);
+  const float  keep = (tol <= 0.0 || abs(here.a - dcur) / ref < tol) ? 1.0 : 0.5;
+  return here.rgb * keep;
+}
+
 [numthreads(16, 16, 1)]
 void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
   if (any(tid.xy >= Size)) return;
@@ -173,72 +196,71 @@ void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
   if (Reproject != 0.0) {
     const float2 mv = MVec.Load(int3(tid.xy, 0)).xy * MvScale;
     const float2 prev = float2(tid.xy) + mv * Reproject;
-    if (any(prev < 0.0) || any(prev >= float2(Size) - 1.0)) {
-      Output[tid.xy] = float4(max(src.rgb, 0.0), src.a);   // disocclusion: pass through
-      return;
-    }
-    // Motion is rarely a whole number of pixels, and the enhancement is a
-    // high-frequency signal, so rounding the tap to the nearest texel smears it
-    // by up to half a pixel -- which is the very misalignment we are here to fix.
-    const float2 f = frac(prev);
-    const int3   b = int3(int2(prev), 0);
-    const float4 t00 = Neural.Load(b);
-    const float4 t10 = Neural.Load(b + int3(1, 0, 0));
-    const float4 t01 = Neural.Load(b + int3(0, 1, 0));
-    const float4 t11 = Neural.Load(b + int3(1, 1, 0));
+    const bool inside = !(any(prev < 0.0) || any(prev >= float2(Size) - 1.0));
+    float wsum = 0.0;
+    if (inside) {
+      // Motion is rarely a whole number of pixels, and the enhancement is a
+      // high-frequency signal, so rounding the tap to the nearest texel smears it
+      // by up to half a pixel -- which is the very misalignment we are here to fix.
+      const float2 f = frac(prev);
+      const int3   b = int3(int2(prev), 0);
+      const float4 t00 = Neural.Load(b);
+      const float4 t10 = Neural.Load(b + int3(1, 0, 0));
+      const float4 t01 = Neural.Load(b + int3(0, 1, 0));
+      const float4 t11 = Neural.Load(b + int3(1, 1, 0));
 
-    // A pixel uncovered by something that moved is inside the frame and reprojects
-    // to a perfectly valid coordinate -- the delta waiting there just belongs to
-    // whatever used to occlude it. Depth is what separates the two: keep only the
-    // taps still sitting on this pixel's surface, and reweight what is left.
-    const float dcur = DepthTex.Load(int3(tid.xy, 0)).x;
-    const float tol  = max(DepthReject, 0.0);
-    float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
-                      (1.0 - f.x) * f.y,         f.x * f.y);
-    if (tol > 0.0) {
-      const float ref = max(abs(dcur), 1e-6);
-      w.x *= (abs(t00.a - dcur) / ref < tol) ? 1.0 : 0.0;
-      w.y *= (abs(t10.a - dcur) / ref < tol) ? 1.0 : 0.0;
-      w.z *= (abs(t01.a - dcur) / ref < tol) ? 1.0 : 0.0;
-      w.w *= (abs(t11.a - dcur) / ref < tol) ? 1.0 : 0.0;
-    }
-    const float wsum = w.x + w.y + w.z + w.w;
-    if (wsum < 1e-4) {                    // nothing here belongs to this surface
-      Output[tid.xy] = float4(max(src.rgb, 0.0), src.a);
-      return;
-    }
-    delta = (t00.rgb * w.x + t10.rgb * w.y + t01.rgb * w.z + t11.rgb * w.w) / wsum;
-
-    // Second guard, for what depth alone misses. The effect is edge enhancement,
-    // so it can only belong where this frame still has an edge. A strong delta
-    // sitting on flat ground is the silhouette of something that has since moved
-    // away -- the arc left behind a turning head. Hold the delta to what the
-    // local structure of the current frame can account for.
-    // Only the doubtful pixels are gated, so the whole neighbourhood scan can be
-    // skipped wherever the history checked out -- which is nearly all of them.
-    // Luminance is taken in the encoded domain: the delta is stored there too, so
-    // the two are directly comparable, and it costs no sRGB decode per tap.
-    if (StructGate > 0.0 && wsum < 0.999) {
-      const float lc = Luminance(proxy_enc);
-      float lo = lc, hi = lc;
-      [unroll] for (int dy = -1; dy <= 1; ++dy)
-        [unroll] for (int dx = -1; dx <= 1; ++dx) {
-          const int2 q = clamp(int2(tid.xy) + int2(dx, dy), int2(0, 0), int2(Size) - 1);
-          const float l = Luminance(Proxy.Load(int3(q, 0)).rgb);
-          lo = min(lo, l); hi = max(hi, l);
-        }
-      const float allowed = (hi - lo) * StructGate;
-      const float mag = max(abs(delta.r), max(abs(delta.g), abs(delta.b)));
-      // Only bind where the history is actually suspect. wsum is the share of taps
-      // whose depth still matches, so 1-wsum is how disoccluded this pixel is.
-      // Gating everywhere would weaken the delta on skipped frames only, and that
-      // difference alternates with the frames that run the network -- which reads
-      // as flicker. Confining it to the doubtful pixels keeps the rest identical.
-      if (mag > allowed) {
-        const float gated = allowed / max(mag, 1e-6);
-        delta *= lerp(1.0, gated, saturate(1.0 - wsum));
+      // A pixel uncovered by something that moved is inside the frame and reprojects
+      // to a perfectly valid coordinate -- the delta waiting there just belongs to
+      // whatever used to occlude it. Depth is what separates the two: keep only the
+      // taps still sitting on this pixel's surface, and reweight what is left.
+      const float dcur = DepthTex.Load(int3(tid.xy, 0)).x;
+      const float tol  = max(DepthReject, 0.0);
+      float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+                        (1.0 - f.x) * f.y,         f.x * f.y);
+      if (tol > 0.0) {
+        const float ref = max(abs(dcur), 1e-6);
+        w.x *= (abs(t00.a - dcur) / ref < tol) ? 1.0 : 0.0;
+        w.y *= (abs(t10.a - dcur) / ref < tol) ? 1.0 : 0.0;
+        w.z *= (abs(t01.a - dcur) / ref < tol) ? 1.0 : 0.0;
+        w.w *= (abs(t11.a - dcur) / ref < tol) ? 1.0 : 0.0;
       }
+      wsum = w.x + w.y + w.z + w.w;
+      if (wsum >= 1e-4) {
+      delta = (t00.rgb * w.x + t10.rgb * w.y + t01.rgb * w.z + t11.rgb * w.w) / wsum;
+
+      // Second guard, for what depth alone misses. The effect is edge enhancement,
+      // so it can only belong where this frame still has an edge. A strong delta
+      // sitting on flat ground is the silhouette of something that has since moved
+      // away -- the arc left behind a turning head. Hold the delta to what the
+      // local structure of the current frame can account for.
+      // Only the doubtful pixels are gated, so the whole neighbourhood scan can be
+      // skipped wherever the history checked out -- which is nearly all of them.
+      // Luminance is taken in the encoded domain: the delta is stored there too, so
+      // the two are directly comparable, and it costs no sRGB decode per tap.
+      if (StructGate > 0.0 && wsum < 0.999) {
+        const float lc = Luminance(proxy_enc);
+        float lo = lc, hi = lc;
+        [unroll] for (int dy = -1; dy <= 1; ++dy)
+          [unroll] for (int dx = -1; dx <= 1; ++dx) {
+            const int2 q = clamp(int2(tid.xy) + int2(dx, dy), int2(0, 0), int2(Size) - 1);
+            const float l = Luminance(Proxy.Load(int3(q, 0)).rgb);
+            lo = min(lo, l); hi = max(hi, l);
+          }
+        const float allowed = (hi - lo) * StructGate;
+        const float mag = max(abs(delta.r), max(abs(delta.g), abs(delta.b)));
+        // Only bind where the history is actually suspect. wsum is the share of taps
+        // whose depth still matches, so 1-wsum is how disoccluded this pixel is.
+        // Gating everywhere would weaken the delta on skipped frames only, and that
+        // difference alternates with the frames that run the network -- which reads
+        // as flicker. Confining it to the doubtful pixels keeps the rest identical.
+        if (mag > allowed) {
+          const float gated = allowed / max(mag, 1e-6);
+          delta *= lerp(1.0, gated, saturate(1.0 - wsum));
+        }
+      }
+        }
     }
+    if (!inside || wsum < 1e-4) delta = DeltaInPlace(tid.xy);
   } else {
     delta = Neural.Load(int3(tid.xy, 0)).rgb;       // Neural slot holds the delta
   }
@@ -257,6 +279,75 @@ void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
   // the end, it applies to the real result and the reconstructed one alike.
   result = lerp(original, result, EffectStrength);
   Output[tid.xy] = float4(result, src.a);
+}
+
+// Carry the stored effect forward by exactly one frame.
+//
+// Reusing a delta that is several frames old means either following one frame of
+// motion (it lands short) or multiplying that frame's motion by its age (it lands
+// wrong the moment the camera turns, because the multiplication assumes the
+// velocity never changed). Both are guesses about frames we did measure and then
+// threw away.
+//
+// So do not let the delta get old. Advect it every frame by the motion of that
+// frame, and it is always where it belongs, with one measured step and nothing
+// extrapolated. The apply pass then samples it in place. The cost is one more
+// resample per frame, which softens the delta slightly -- acceptable for a signal
+// this low-frequency, and cheap next to being in the wrong place.
+[numthreads(16, 16, 1)]
+void CSAdvect(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  const float  dcur = DepthTex.Load(int3(tid.xy, 0)).x;
+  const float2 mv   = MVec.Load(int3(tid.xy, 0)).xy * MvScale;
+  const float2 prev = float2(tid.xy) + mv;          // one frame, never a multiple
+  if (any(prev < 0.0) || any(prev >= float2(Size) - 1.0)) {
+    Output[tid.xy] = float4(0.0, 0.0, 0.0, dcur);   // came from off-screen: no history
+    return;
+  }
+  const float2 f = frac(prev);
+  const int3   b = int3(int2(prev), 0);
+  const float4 t00 = Neural.Load(b);
+  const float4 t10 = Neural.Load(b + int3(1, 0, 0));
+  const float4 t01 = Neural.Load(b + int3(0, 1, 0));
+  const float4 t11 = Neural.Load(b + int3(1, 1, 0));
+  float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+                    (1.0 - f.x) * f.y,         f.x * f.y);
+  const float tol = max(DepthReject, 0.0);
+  if (tol > 0.0) {
+    const float ref = max(abs(dcur), 1e-6);
+    w.x *= (abs(t00.a - dcur) / ref < tol) ? 1.0 : 0.0;
+    w.y *= (abs(t10.a - dcur) / ref < tol) ? 1.0 : 0.0;
+    w.z *= (abs(t01.a - dcur) / ref < tol) ? 1.0 : 0.0;
+    w.w *= (abs(t11.a - dcur) / ref < tol) ? 1.0 : 0.0;
+  }
+  const float wsum = w.x + w.y + w.z + w.w;
+  // Nothing here belongs to this surface any more: let the effect fade at a
+  // disocclusion rather than drag the occluder's delta along with it.
+  const float3 d = (wsum < 1e-4) ? float3(0.0, 0.0, 0.0)
+      : (t00.rgb * w.x + t10.rgb * w.y + t01.rgb * w.z + t11.rgb * w.w) / wsum;
+  Output[tid.xy] = float4(d, dcur);   // alpha carries the depth it now belongs to
+}
+
+// Take a private copy of one of the game's textures.
+//
+// The network reads Color, Depth and MVec straight from the game. That is fine
+// while it runs on the same queue as the render, in order; it stops being fine the
+// moment the network runs anywhere else, because the graphics queue is already
+// drawing the next frame into those same textures. A copy is what makes the
+// network's inputs hold still.
+//
+// It reads through an SRV rather than CopyResource on purpose: an SRV is the state
+// the add-on already relies on these resources being in at this exact point, while
+// a copy would need them transitioned to COPY_SOURCE and back -- a state change on
+// a resource the game owns and whose real state we are only guessing at.
+//
+// One kernel serves all three. Writing a float4 into a one- or two-channel typed
+// UAV drops the components that do not exist, and depth arrives as .x through the
+// same format mapping the codec already does for its own depth reads.
+[numthreads(16, 16, 1)]
+void CSSnapshot(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  Output[tid.xy] = Original.Load(int3(tid.xy, 0));
 }
 
 // Luminance histogram of the scene buffer, log2-spaced so it covers HDR range

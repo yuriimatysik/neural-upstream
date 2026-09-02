@@ -42,6 +42,25 @@ to the current frame. Where the depth says the surface underneath has changed, i
 is dropped: that is a disocclusion, and the effect waiting there belongs to
 whatever used to be in front.
 
+
+## Running under frame generation
+
+Use **Quality** — the network on every frame — if DLSS Frame Generation is also on.
+
+The network costs ~4.8 ms of an 8.9 ms rendered frame. At any cadence above 1 it
+runs on one frame in two or three, so the rendered interval alternates (8.9 / 13.9
+ms here) and DLSS-G, which places its generated frames inside that interval,
+cannot pace through a swing that size. The result is stutter and flashes that
+grow with the multiplier.
+
+It is not an image problem: with `EffectStrength=0` — identical work, no visible
+effect — the artefact is unchanged. Quality costs the same in total, spread
+evenly, and paces cleanly at 4x.
+
+What remains above Quality is flicker, from reusing one frame's effect on the
+next. `FINDINGS.md` records the two attempts to correct for the delta's age, both
+of which made it worse.
+
 ## Building
 
 Third-party SDKs are not vendored. Fetch them into `external/`:

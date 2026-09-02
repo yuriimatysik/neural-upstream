@@ -226,3 +226,98 @@ never measured worse; that is as strong a claim as one run each supports.
   runs that were not comparable.
 - **Pick a benchmark that costs a minute.** Swapping a AAA game for a 2.5 GB
   standalone benchmark changed which experiments were worth running at all.
+
+---
+
+## 6. Coexisting with frame generation
+
+Everything above was measured with the add-on alone. Running it underneath DLSS
+Multi Frame Generation at 3x and 4x broke it in ways none of the image code
+explained, and the search cost a day. What follows is the short version.
+
+### The artefact was frame pacing, and the cadence caused it
+
+The network costs **4.8 ms of an 8.9 ms rendered frame** — 54% of the budget. At
+cadence 2 that lands on every other frame, so the rendered interval alternates
+**8.9 / 13.9 ms**. DLSS-G places its generated frames inside that interval and
+cannot pace through a 56% swing, which is why the artefact grew with both the
+multiplier and the cadence, and why Quality was the only mode that worked: same
+total cost, but uniform.
+
+### What it was not, each ruled out with evidence
+
+| theory | how it died |
+| --- | --- |
+| our `sm_89` kernels | a third-party multi-arch build shows the same artefact |
+| a failing evaluate | `erfail=0 grfail=0` — not one failure in a whole session |
+| what the add-on draws | `EffectStrength=0` — same work, no visual effect, artefact unchanged |
+| the shader's compositing | four separate image fixes moved nothing |
+| Streamline's descriptor heap | the same wrap rate at 2x, which NVIDIA ships |
+
+`will skip the present` in `sl.log` is **not** an artefact: it fires whenever FG
+is switched off, which is teardown. Reading it as a failure cost hours.
+
+### Two real bugs found on the way
+
+- **The descriptor ring was eight slots.** Three dispatches a frame with the CPU
+  two or three frames ahead of the GPU left ~2.7 frames of headroom, so slots were
+  being recycled while still in flight. It had been that way from the first day and
+  is the most likely cause of artefacts blamed on other things. Now 64.
+- **43% of evaluates were handed the raw colour.** The game issues more than one
+  evaluate per frame and only the first claims it; the rest took the skipped-frame
+  path and threw the enhancement away, even though `final_tex` already held that
+  very frame. Whether the effect was seen depended on which evaluate reached the
+  screen.
+
+### The instrument kept becoming the experiment
+
+Twice. `ring_dump` wrote 1024 lines through a logger that locks and flushes per
+message, on the present thread — pressing the key *produced* the artefact it was
+meant to catch. Later `prof_report` was wired to Map and Unmap a readback buffer
+every present. A stall on the present thread is visible on screen; anything
+measuring from there has to cost nothing. All of it now hangs off `Diagnostics`,
+off by default.
+
+And the profiler had never worked at all: `prof_report()` was defined and never
+called, *and* `g_prof.freq` was declared and never assigned, so it returned on its
+first line regardless. Every cost figure quoted before this point came from
+nowhere.
+
+### Three more levers, all null or negative
+
+| change | result |
+| --- | --- |
+| `DLSSNR.ScalingRatio` below 1.0 | inert, like `Hint.Render.Preset`; cost unchanged |
+| reprojection scaled by the delta's age | shifting under a turning camera — the multiple assumes constant velocity |
+| advecting the delta one frame per frame | worse still, though it extrapolates nothing |
+
+The second and third attack the same thing from opposite directions and both
+made it worse, which says the residual flicker at cadence > 1 is not about *where*
+the delta is placed. It is the cost of reusing an effect across frames at all.
+That also retires the async-queue argument for fixing it: that design reprojects
+identically.
+
+### What did work
+
+- **Build every frame the same way** (`UniformDelta`). Above cadence 1 the image
+  used to alternate between the network's output developed directly and the stored
+  effect reprojected — two different paths, one flickering against the other. Now
+  the fresh result only ever arrives as the next frame's delta, and what varies is
+  the delta's age rather than which path drew the frame.
+- **Clip both paths or neither.** `CSApplyDelta` clamped its reconstructed value
+  and `CSDecode` did not, so the two disagreed on highlights — on HDR content, a
+  flicker on exactly the pixels the eye tracks.
+- **Degrade, do not cliff.** A pixel whose history cannot be reprojected used to
+  fall back to the game's own colour: full effect one frame, none the next, on
+  exactly the pixels motion uncovers.
+
+### Still open
+
+- A rare black flash that only appears with the add-on enabled. A 120 ms stall
+  does not reproduce it, it does not correlate with the >100 ms frames Streamline
+  reports, and a session with identical settings can show none at all.
+- The 4.8 ms itself. Two routes remain: run the network below render resolution
+  (less work, moderate risk) or move it to a second queue (same work, off the
+  critical path, and a synchronisation bug there hangs the GPU). Stage one of the
+  second route is done and validated — the network reads private copies of Color,
+  Depth and MVec correctly, and those copies cost 0.07 ms.

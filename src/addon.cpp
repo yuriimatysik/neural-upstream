@@ -620,8 +620,10 @@ struct Codec {
 // while its dispatch is still in flight hands the shader another frame's views.
 // Eight was already only ~2.7 frames of headroom at three dispatches a frame, and
 // the snapshot path takes it to six a frame -- 1.3 frames, which corrupts reliably.
-// The heap is kCxSlots * 7 descriptors and nothing else, so this is cheap.
-static const unsigned kCxSlots = 64;     // descriptors per slot: t0..t4, u0, u1
+// The heap is kCxSlots * kCxDescriptorsPerSlot descriptors and nothing else,
+// so this is cheap. Keep the layout in one place: t0..t4, u0, u1.
+static const unsigned kCxSlots = 64;
+static const unsigned kCxDescriptorsPerSlot = 7;
 
 // These two return a struct by value: MSVC uses the hidden-sret convention that
 // MinGW does not match, so call them through the vtable explicitly.
@@ -744,7 +746,7 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kCxSlots * 7;      // t0..t4, u0, u1
+    hd.NumDescriptors = kCxSlots * kCxDescriptorsPerSlot;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_cx.heap)))) {
         logf("[NRPRE] codec: descriptor heap failed"); return false;
@@ -1149,7 +1151,6 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             release_state("Color resource resolution changed");
             return t_orig_eval(cmd, feat, params, cb);
         }
-        if (color_w && color_h) track_recording(cmd);
     }
 
     {   // heartbeat: proves whether the hook survives a device/swapchain recreation
@@ -1222,6 +1223,17 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         ID3D12Resource      *in  = hi ? dst_col        : src;
 
         if (in && dep && mv) {
+            // Track only lists where this add-on is about to write GPU work.
+            // Tracking every Color evaluate also tracked passthrough/disabled
+            // evaluates; if one of those lists was discarded, resize cleanup
+            // waited forever and NR could no longer be toggled.
+            bool recording_tracked = false;
+            auto ensure_recording = [&]() {
+                if (!recording_tracked) {
+                    track_recording(cmd);
+                    recording_tracked = true;
+                }
+            };
             ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
             if (g_async_net && g_cx.pso_snap != nullptr && dep != nullptr && mv != nullptr) {
                 if (!g_cx.snap_ready) {
@@ -1232,6 +1244,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     logf("[NRPRE] snapshot: %ux%u ready=%d", w_net, h_net, (int)g_cx.snap_ready);
                 }
                 if (g_cx.snap_ready) {
+                    ensure_recording();
                     prof_mark(cmd, 4);
                     snapshot_dispatch(cmd, g_device, in,  g_cx.snap_color,
                                       DXGI_FORMAT_R16G16B16A16_FLOAT, w_net, h_net);
@@ -1374,6 +1387,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             g_net_w = w_net; g_net_h = h_net;
 
             if (use_codec && g_auto_pw && run_now) {
+                ensure_recording();
                 ID3D12Resource *etex = nullptr;
                 if (g_ptr_slot >= 0)
                     param_get_slot(params, (unsigned)g_ptr_slot,
@@ -1384,6 +1398,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
 
             if (run_now) {
+                ensure_recording();
                 prof_init(g_device);
                 prof_mark(cmd, 0);
                 if (use_codec) {
@@ -1961,8 +1976,8 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
-    cpu.ptr += (SIZE_T)slot * 7 * g_cx.inc;
-    gpu.ptr += (UINT64)slot * 7 * g_cx.inc;
+    cpu.ptr += (SIZE_T)slot * kCxDescriptorsPerSlot * g_cx.inc;
+    gpu.ptr += (UINT64)slot * kCxDescriptorsPerSlot * g_cx.inc;
 
     // The depth buffer is typeless (GTA V: R32G8X24_TYPELESS), so a fixed colour
     // format here creates an invalid view and removes the device. Derive each
@@ -2065,8 +2080,8 @@ static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     g_cx.slot = (g_cx.slot + 1) % kCxSlots;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
-    cpu.ptr += (SIZE_T)slot * 7 * g_cx.inc;
-    gpu.ptr += (UINT64)slot * 7 * g_cx.inc;
+    cpu.ptr += (SIZE_T)slot * kCxDescriptorsPerSlot * g_cx.inc;
+    gpu.ptr += (UINT64)slot * kCxDescriptorsPerSlot * g_cx.inc;
 
     D3D12_RESOURCE_DESC sd0{};
     DXGI_FORMAT srv_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2481,14 +2496,27 @@ static void record_exposure_sample(ID3D12GraphicsCommandList *cmd, ID3D12Device 
                                    ID3D12Resource *src, ID3D12Resource *depth,
                                    unsigned w, unsigned h)
 {
-    if (!g_cx.hist || !g_cx.pso_hist || !g_cx.clear_heap) return;
+    if (!g_cx.hist || !g_cx.pso_hist || !g_cx.clear_heap ||
+        !g_cx.heap || !dev || g_cx.inc == 0) return;
     static unsigned n = 0;
     const unsigned period = g_exp_from_game ? 60u : 20u;   // guides only, when the game covers exposure
     if ((n++ % period) != 0 || g_cx.pending || g_cx.copy_recorded) return;
 
     const unsigned slot = g_cx.slot;                 // codec_dispatch will use this slot
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
-    gpu.ptr += (UINT64)slot * 5 * g_cx.inc + (UINT64)4 * g_cx.inc;   // u1
+    // The root table is t0..t4, u0, u1. The old slot*5+4 address pointed at
+    // another slot's SRV (and even slot 0 was t4), so the clear could remove
+    // the D3D12 device after the histogram had run for a while. This slot has
+    // not gone through codec_dispatch yet, so create u1 before using it.
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
+    cpu.ptr += ((SIZE_T)slot * kCxDescriptorsPerSlot + 6u) * g_cx.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC hv{};
+    hv.Format = DXGI_FORMAT_UNKNOWN;
+    hv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    hv.Buffer.NumElements = kHistBins;
+    hv.Buffer.StructureByteStride = sizeof(UINT);
+    dev->CreateUnorderedAccessView(g_cx.hist, nullptr, &hv, cpu);
+    gpu.ptr += ((UINT64)slot * kCxDescriptorsPerSlot + 6u) * g_cx.inc; // u1
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
@@ -2903,7 +2931,6 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         queue->get_device()->get_api() == reshade::api::device_api::d3d12)
         install_submission_hook(reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()));
     service_pending_cleanup();
-    if (g_resize_pending) return;
     static bool prev_down = false;
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (down && !prev_down) {
@@ -2978,6 +3005,18 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         g_jit_burst = 40;
     }
     ph_prev = ph_down;
+
+    // Keep controls alive while old GPU work drains. Previously this return sat
+    // above all hotkeys, so one never-submitted list made F7 appear dead forever.
+    static unsigned pending_report = 0;
+    if (g_resize_pending) {
+        if (g_diagnostics && (++pending_report % 120u) == 0u)
+            logf("[NRPRE] cleanup still pending: lists=%zu fences=%zu signal_failed=%d",
+                 g_recorded_lists.size(), g_submission_fences.size(),
+                 (int)g_submission_failed);
+        return;
+    }
+    pending_report = 0;
 
     prof_report();   // estaba definido y nunca se llamaba: nunca hubo una linea PERFIL
     frame_tick();

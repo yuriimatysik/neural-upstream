@@ -144,6 +144,11 @@ static int g_diag_frames = 0;
 // every present. None of that belongs in a session that is being played rather
 // than measured, so it all hangs off one switch.
 static bool g_diagnostics = true;
+// ReShade can recreate the effect runtime while the game is running. Settings
+// are loaded through that callback, but Enabled is also changed live by the
+// overlay and F7; re-reading the INI on every callback silently undid either
+// action a moment later.
+static bool g_enabled_setting_loaded = false;
 
 #ifdef NR_STANDALONE
 static reshade::api::device        g_host_dev;
@@ -2159,7 +2164,11 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 // ReShade keeps one ReShade.ini per game, so this is per-game config for free.
 static void load_settings(reshade::api::effect_runtime *rt) {
     int v = 0; float f = 0.0f;
-    if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))       g_nr_enabled = (v != 0);
+    if (!g_enabled_setting_loaded) {
+        if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))
+            g_nr_enabled = (v != 0);
+        g_enabled_setting_loaded = true;
+    }
     if (reshade::get_config_value(rt, "NRPreUpscale", "AsyncNetwork", v)) g_async_net = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "StallMs", v)) g_stall_ms = (v < 1 ? 1 : (v > 500 ? 500 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "UniformDelta", v)) g_uniform_delta = (v != 0);

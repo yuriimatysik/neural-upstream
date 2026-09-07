@@ -43,3 +43,4 @@ jobs:
             SHA256SUMS
             BUILDING.md
             LICENSE
+            external/minhook/LICENSE.txt

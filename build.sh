@@ -2,7 +2,7 @@
 set -e
 cd "$(dirname "$0")"
 "${CXX:-g++}" -shared -std=c++20 -O2 -DNDEBUG \
-  -I external/reshade/include -I external/ngx/include \
+  -I build-compat -I external/reshade/include -I external/ngx/include \
   -I external/minhook/include -I external/imgui \
   -o neural-upstream.addon64 src/addon.cpp \
   external/minhook/src/hook.c external/minhook/src/buffer.c \

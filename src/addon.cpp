@@ -1326,12 +1326,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // Every one of our textures starts and ends each frame in UAV state,
             // so the sequence below is self-contained and safe to toggle at will.
             // Rebuild if the device changed under us, or the render target resized.
+            // The frame that tears the state down must not then use it: use_codec and
+            // the codec resources were latched above, and release_state has just nulled
+            // them. Skip this frame entirely; the next one rebuilds cleanly.
+            bool did_reset = false;
             if (w_net != 0 && (w_net != g_net_w || h_net != g_net_h)) {
-                if (g_net_w != 0) release_state("render resolution changed");
+                if (g_net_w != 0) { release_state("render resolution changed"); did_reset = true; }
                 g_net_w = w_net; g_net_h = h_net;
             }
 
-            if (use_codec && g_auto_pw && run_now) {
+            if (use_codec && g_auto_pw && run_now && !did_reset) {
                 ID3D12Resource *etex = nullptr;
                 if (g_ptr_slot >= 0)
                     param_get_slot(params, (unsigned)g_ptr_slot,
@@ -1341,7 +1345,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 else record_exposure_sample(cmd, g_device, in, dep, w_net, h_net);
             }
 
-            if (run_now) {
+            if (run_now && !did_reset) {
                 prof_init(g_device);
                 prof_mark(cmd, 0);
                 if (use_codec) {
@@ -1732,9 +1736,12 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
     r = core_scratch(kFeatureDLSSNR, g_nr_params, &bytes);
     g_scratch_size = bytes;
     logf("[NRPRE] 2b: scratch(18) -> 0x%08X size=%llu", (unsigned)r, (unsigned long long)bytes);
+    // A community Ada runtime is not vetted by the NGX core, so the core refuses
+    // feature 18 and this query fails. That is expected there, and it is not a
+    // reason to stop: the snippet route below needs neither, and it is the only
+    // path that works on those runtimes. g_scratch_size is never read anywhere.
     if (r != NVSDK_NGX_Result_Success) {
-        logf("[NRPRE] 2b: setup abandoned, scratch failed 0x%08X", (unsigned)r);
-        g_setup_done = true; return;
+        logf("[NRPRE] 2b: core scratch unavailable (0x%08X) - continuing to the snippet route", (unsigned)r);
     }
 
     if (cmd == nullptr) { logf("[NRPRE] 2b: setup deferred, no command list"); return; }
@@ -1745,6 +1752,25 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
     logf("[NRPRE] 2b: ScalingRatio=%.3f (1.0 = misma resolucion dentro y fuera)", g_net_scale);
     pset_u(g_nr_params, "DLSSNR.UseAutoMask", g_auto_mask ? 1u : 0u);
     pset_u(g_nr_params, "DLSSNR.Style", (unsigned)g_style);
+    // Geometry. Without these the subrect defaults to zero and the network is asked
+    // to process a 0x0 region: every evaluate returns success and does no work.
+    // On an RTX 4090 with the 310.8.0-RTX40 runtime this is the difference between
+    // 0.000 ms and 8.0 ms of real network time.
+    pset_u(g_nr_params, "DLSSNR.InputWidth",   w);
+    pset_u(g_nr_params, "DLSSNR.InputHeight",  h);
+    pset_u(g_nr_params, "DLSSNR.OutputWidth",  w);
+    pset_u(g_nr_params, "DLSSNR.OutputHeight", h);
+    static const char *const kSubW[] = { "DLSSNR.ColorSubrectWidth",  "DLSSNR.DepthSubrectWidth",
+                                         "DLSSNR.MVecSubrectWidth",   "DLSSNR.OutputSubrectWidth" };
+    static const char *const kSubH[] = { "DLSSNR.ColorSubrectHeight", "DLSSNR.DepthSubrectHeight",
+                                         "DLSSNR.MVecSubrectHeight",  "DLSSNR.OutputSubrectHeight" };
+    static const char *const kSubB[] = { "DLSSNR.ColorSubrectBaseX",  "DLSSNR.ColorSubrectBaseY",
+                                         "DLSSNR.DepthSubrectBaseX",  "DLSSNR.DepthSubrectBaseY",
+                                         "DLSSNR.MVecSubrectBaseX",   "DLSSNR.MVecSubrectBaseY",
+                                         "DLSSNR.OutputSubrectBaseX", "DLSSNR.OutputSubrectBaseY" };
+    for (int i = 0; i < 4; ++i) { pset_u(g_nr_params, kSubW[i], w); pset_u(g_nr_params, kSubH[i], h); }
+    for (int i = 0; i < 8; ++i) pset_u(g_nr_params, kSubB[i], 0);
+
     pset_u(g_nr_params, "CreationNodeMask", 1);
     pset_u(g_nr_params, "VisibilityNodeMask", 1);
 
@@ -1872,6 +1898,19 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
         case DXGI_FORMAT_D32_FLOAT:            return DXGI_FORMAT_R32_FLOAT;
         case DXGI_FORMAT_D16_UNORM:            return DXGI_FORMAT_R16_UNORM;
         case DXGI_FORMAT_R16_TYPELESS:         return DXGI_FORMAT_R16_UNORM;
+        // Colour and motion vectors can be typeless too. Dead Space (2023) hands
+        // over R16G16B16A16_TYPELESS colour and R16G16_TYPELESS motion vectors;
+        // without these they reach default, a view is built with a typeless
+        // format, and the device is removed on the first evaluate.
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R32G32_TYPELESS:       return DXGI_FORMAT_R32G32_FLOAT;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_FLOAT;
+        case DXGI_FORMAT_R8G8_TYPELESS:         return DXGI_FORMAT_R8G8_UNORM;
+        case DXGI_FORMAT_R8_TYPELESS:           return DXGI_FORMAT_R8_UNORM;
         default:                               return d.Format;
         }
     };
@@ -2499,20 +2538,35 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
 // rebuilt, so afterwards we kept feeding DLSS textures that belonged to a dead
 // device or held a stale frame -- visible as the image "breaking" until another
 // mode switch happened to land somewhere consistent.
-static void release_state(const char *why) {
-    logf("[NRPRE] resetting state (%s)", why);
+// Deferred destruction. release_state runs mid-frame while command lists that
+// reference these resources are still in flight, so freeing them here is a
+// use-after-free on the GPU timeline. RDR1 changes render resolution on its
+// second frame and dies instantly. Retire one generation and free the previous
+// one at the next reset, seconds later, when the GPU is long finished with it.
+static std::vector<IUnknown *> g_retired;
+static NVSDK_NGX_Handle      *g_retired_feature = nullptr;
 
-    if (g_nr_handle != nullptr) {
+static void drain_retired() {
+    if (g_retired_feature != nullptr) {
         HMODULE snip = GetModuleHandleW(L"nvngx_dlssnr.dll");
         typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_Release)(NVSDK_NGX_Handle *);
         auto rel = snip ? reinterpret_cast<PFN_Release>(
                        SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_ReleaseFeature", "nr_release")) : nullptr;
-        if (rel) rel(g_nr_handle);
-        g_nr_handle = nullptr;
+        if (rel) rel(g_retired_feature);
+        g_retired_feature = nullptr;
     }
+    for (IUnknown *p : g_retired) if (p != nullptr) p->Release();
+    g_retired.clear();
+}
+
+static void release_state(const char *why) {
+    drain_retired();          // free the PREVIOUS generation, never this one
+    logf("[NRPRE] resetting state (%s)", why);
+
+    if (g_nr_handle != nullptr) { g_retired_feature = g_nr_handle; g_nr_handle = nullptr; }
     if (g_nr_handle_hi) { g_nr_handle_hi = nullptr; }
 
-    auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
+    auto rls = [](auto *&p) { if (p) { g_retired.push_back(static_cast<IUnknown *>(p)); p = nullptr; } };
     rls(g_nr_out); rls(g_nr_out_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     rls(g_cx.heap); rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);

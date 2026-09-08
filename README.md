@@ -80,7 +80,8 @@ Then `./build.sh`. Needs a MinGW-w64 g++ with C++20.
 
 ## Installing
 
-The build script installs to the game folder as `nvngx.dll.addon64`.
+The build script writes `neural-upstream.addon64`. Copy it to the game folder as
+`nvngx.dll.addon64`.
 
 **The filename matters.** The NGX snippet gates feature creation on the calling
 module's path containing `nvngx.dll`; under any other name it returns
@@ -88,6 +89,12 @@ module's path containing `nvngx.dll`; under any other name it returns
 
 Needs ReShade with add-on support, and `nvngx_dlssnr.dll` in the game folder.
 Everything is configured from the ReShade overlay.
+
+`F7` toggles Neural Rendering and clears its temporal history when turning it
+back on. `F6` switches Effect strength between normal (`1`) and an exaggerated
+diagnostic value (`3`); it no longer makes an enabled effect invisible. Old
+saved configurations with enabled NR and zero Effect strength are repaired to
+`1` when loaded.
 
 ## Where the time goes
 

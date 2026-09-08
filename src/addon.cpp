@@ -20,6 +20,7 @@
 #include "submission_tracker.h"
 #include "descriptor_lifetime.h"
 #include "feature_registry.h"
+#include "control_state.h"
 #include <atomic>
 #include <new>
 #include <vector>
@@ -126,7 +127,7 @@ static unsigned feat_id(const NVSDK_NGX_Handle *h) {
 }
 
 static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd);   // defined below
-static bool g_nr_enabled = true;    // starts in the optimal mode; F7 toggles
+static nr::ControlState g_controls; // starts enabled and visible; UI and hotkeys share this state
 static unsigned g_net_w, g_net_h;
 static unsigned g_setup_w = 0, g_setup_h = 0;
 static std::recursive_mutex g_state_mutex;
@@ -151,7 +152,7 @@ static int g_diag_frames = 0;
 // visible on screen. prof_report() additionally Maps and Unmaps a readback buffer
 // every present. None of that belongs in a session that is being played rather
 // than measured, so it all hangs off one switch.
-static bool g_diagnostics = true;
+static bool g_diagnostics = false;
 // ReShade can recreate the effect runtime while the game is running. Settings
 // are loaded through that callback, but Enabled is also changed live by the
 // overlay and F7; re-reading the INI on every callback silently undid either
@@ -211,6 +212,7 @@ static Prof g_prof;
 static bool g_profiling = true;
 
 static bool prof_init(ID3D12Device *dev) {
+    if (!g_diagnostics || !g_profiling) return false;
     if (g_prof.ready) return true;
     if (dev == nullptr) return false;
     D3D12_QUERY_HEAP_DESC qd{};
@@ -241,7 +243,7 @@ static inline void prof_mark(ID3D12GraphicsCommandList *cmd, unsigned m) {
 }
 
 static void prof_resolve(ID3D12GraphicsCommandList *cmd) {
-    if (!g_profiling || !g_prof.ready || cmd == nullptr) return;
+    if (!g_diagnostics || !g_profiling || !g_prof.ready || cmd == nullptr) return;
     cmd->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP,
                           g_prof.slot * kMarks, kMarks, g_prof.rb,
                           sizeof(UINT64) * g_prof.slot * kMarks);
@@ -313,7 +315,6 @@ static bool  g_final_valid = false;   // final_tex holds a real frame
 static float g_input_gain = 1.0f;
 static int   g_preset = 3;              // 0 custom, 1 subtle, 2 natural, 3 strong, 4 max
 static float g_chroma_transfer = 0.0f;  // adopt the network's own colour, not just its light
-static float g_effect_strength = 1.0f;  // blend back toward the game's own image
 static float g_struct_gate  = 1.0f;     // delta allowed, relative to local contrast
 static float g_depth_reject = 0.02f;    // relative depth gap that reads as a disocclusion
 static float g_reproject = 1.0f;        // follow motion vectors when reusing the delta
@@ -335,7 +336,7 @@ static bool g_delta_advect = false;   // measured worse than leaving the delta i
 static float g_mv_scale_x = 1.0f, g_mv_scale_y = 1.0f;   // the game's own, captured live
 static float g_delta_clamp = 0.25f;     // cap in encoded units; 0 disables clamping
 static bool g_skip_passthrough = true;  // skipped frames pass the game's colour, not a stale one
-static int g_jit_burst = 40;      // F11 arms a burst that dumps the jitter sequence
+static int g_jit_burst = 0;       // F10/F11 explicitly arm a diagnostic jitter dump
 static unsigned long long g_eval_tick = 0;
 
 // The game evaluates DLSS twice per rendered frame with the *same* jitter (measured:
@@ -360,6 +361,30 @@ static volatile LONG64 g_jit_key = 0;
 static volatile LONG64 g_jit_run = 0;             // consecutive same-key repeats
 static volatile LONG64 g_frame_seq = 0;
 static const unsigned kMaxClaimThreads = 16;      // ~7 call today; headroom, not a limit
+
+static void reset_temporal_history() {
+    g_reset_pending = true;
+    g_final_valid = false;
+    g_delta_valid = false;
+    g_delta_age = 1;
+    g_phase = 0;
+    InterlockedExchange64(&g_jit_key, 0);
+    InterlockedExchange64(&g_jit_run, 0);
+}
+
+static bool set_nr_enabled(bool enabled, const char *source) {
+    const auto result = g_controls.set_enabled(enabled);
+    if (!result.changed) return false;
+
+    if (result.reset_history) reset_temporal_history();
+    logf("[NRPRE] %s: DLSS-NR %s%s", source,
+         g_controls.enabled ? "ON" : "OFF",
+         result.restored_strength ? " (EffectStrength restored to 1.0)" : "");
+    if (g_controls.enabled && g_submission_failed)
+        logf("[NRPRE] NR remains in fail-safe passthrough after submission tracking failed; restart the game");
+    return true;
+}
+
 static bool claim_frame(float jx, float jy, unsigned long long *out_frame) {
     unsigned kx, ky;
     std::memcpy(&kx, &jx, 4);
@@ -1036,10 +1061,10 @@ static int    g_bench_rounds = 0;
 
 static void bench_apply() {
     switch (g_bench_state) {
-    case 0: g_nr_enabled = false; g_skip_n = 1; break;
-    case 1: g_nr_enabled = true;  g_skip_n = 1; break;
-    case 2: g_nr_enabled = true;  g_skip_n = 2; break;
-    case 3: g_nr_enabled = true;  g_skip_n = 3; break;
+    case 0: set_nr_enabled(false, "benchmark"); g_skip_n = 1; break;
+    case 1: set_nr_enabled(true,  "benchmark"); g_skip_n = 1; break;
+    case 2: set_nr_enabled(true,  "benchmark"); g_skip_n = 2; break;
+    case 3: set_nr_enabled(true,  "benchmark"); g_skip_n = 3; break;
     }
 }
 
@@ -1094,11 +1119,11 @@ static void frame_tick() {
     static int skip = 0;
     static bool prev_state = false;
 
-    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); prev_state = g_nr_enabled; }
+    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); prev_state = g_controls.enabled; }
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
 
-    if (g_nr_enabled != prev_state) {          // our NR toggled -> drop the window
-        prev_state = g_nr_enabled; head = count = 0; skip = 30;
+    if (g_controls.enabled != prev_state) {          // our NR toggled -> drop the window
+        prev_state = g_controls.enabled; head = count = 0; skip = 30;
     }
     if (prev.QuadPart != 0) {
         double ms = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)freq.QuadPart;
@@ -1139,7 +1164,7 @@ static void frame_tick() {
         g_ui_ms = (float)avg;
         g_ui_fps = (float)(1000.0 / avg);
         g_ui_nr_hz = (float)evals / 10.0f;          // window is 10 s
-        if (!g_nr_enabled) g_ui_base_ms = (float)avg;
+        if (!g_controls.enabled) g_ui_base_ms = (float)avg;
     }
 }
 
@@ -1344,7 +1369,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                  g_hdr_mode, (int)g_hdr_detected, g_knee, g_knee_measured,
                  g_exp_fresh, (int)g_exp_from_game,
                  g_net_w, g_net_h, (int)g_final_valid,
-                 (int)g_nr_enabled, g_effect_strength, g_transfer,
+                 (int)g_controls.enabled, g_controls.effect_strength, g_transfer,
                  g_skip_n, (int)g_async_net,   // which mode was actually running, always
                  g_er_fail, g_gr_fail, g_pass_frames,
                  (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback",
@@ -1378,7 +1403,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         if (color_w > 0 && color_h > 0) setup_nr(color_w, color_h, cmd);
     }
     // ---- 2c: run NR at render resolution on the DLSS input colour, discard result ----
-    if (g_nr_enabled && g_nr_handle && g_nr_out && g_nr_eval && params) {
+    if (g_controls.enabled && g_nr_handle && g_nr_out && g_nr_eval && params) {
         ID3D12Resource *src = nullptr, *dep = nullptr, *mv = nullptr;
         if (g_ptr_slot >= 0) {
             param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_Color,
@@ -1502,7 +1527,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 if (rst != 0) g_reset_pending = true;
                 pset_u(pp, "DLSSNR.Reset", g_reset_pending ? 1u : 0u); // honour camera cuts
                 pset_i(pp, "DLSSNR.Reset", g_reset_pending ? 1 : 0);   // ...and as int
-                if (g_diag_frames > 0)
+                if (g_diagnostics && g_diag_frames > 0)
                     logf("[NRPRE] RST gameI=%d(0x%08X) gameU=%u(0x%08X) force=%d pending=%d",
                          rst_i, (unsigned)ri, rst_u, (unsigned)ru,
                          g_force_reset_frames, (int)g_reset_pending);
@@ -1738,7 +1763,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, src);
                 barrier_transition(cmd, feed, kSRV, kUAV);
-                if (g_diag_frames > 0) {
+                if (g_diagnostics && g_diag_frames > 0) {
                     --g_diag_frames;
                     D3D12_RESOURCE_DESC fd{}, sd2{};
                     res_desc(feed, &fd); res_desc(src, &sd2);
@@ -1758,7 +1783,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                           run_now, use_codec, g_final_valid, g_delta_valid, false);
                 return gr;
             }
-            if (g_diag_frames > 0) {
+            if (g_diagnostics && g_diag_frames > 0) {
                 --g_diag_frames;
                 logf("[NRPRE] DIAG tick=%llu run=%d skip=%d codec=%d finalvalid=%d NO REBIND (feed=%p)",
                      (unsigned long long)tick, (int)run_now, g_skip_n, (int)use_codec,
@@ -2339,7 +2364,7 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
         (g_delta_advect && g_cx.pso_advect) ? 0.0f
             : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
         g_depth_reject, g_struct_gate,
-        g_effect_strength, g_chroma_transfer, 0.0f };
+        g_controls.effect_strength, g_chroma_transfer, 0.0f };
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
@@ -2444,16 +2469,21 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 // ---- settings persistence ------------------------------------------------
 // ReShade keeps one ReShade.ini per game, so this is per-game config for free.
 static void load_settings(reshade::api::effect_runtime *rt) {
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     int v = 0; float f = 0.0f;
     if (!g_enabled_setting_loaded) {
         if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))
-            g_nr_enabled = (v != 0);
+            g_controls.enabled = (v != 0);
         g_enabled_setting_loaded = true;
     }
     if (reshade::get_config_value(rt, "NRPreUpscale", "AsyncNetwork", v)) g_async_net = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "StallMs", v)) g_stall_ms = (v < 1 ? 1 : (v > 500 ? 500 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "UniformDelta", v)) g_uniform_delta = (v != 0);
-    if (reshade::get_config_value(rt, "NRPreUpscale", "Diagnostics", v)) g_diagnostics = (v != 0);
+    // The old Diagnostics key shipped enabled and can make the present thread map
+    // GPU readback plus flush logs during normal play. Use a new opt-in key so that
+    // stale game INIs cannot silently re-enable that experimental work.
+    if (reshade::get_config_value(rt, "NRPreUpscale", "DeveloperDiagnostics", v))
+        g_diagnostics = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAdvect", v)) g_delta_advect = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAgeScale", v)) g_delta_age_scale = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "NetScale", f))
@@ -2481,13 +2511,18 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Preset", v)) g_preset = v;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Transfer", f)) g_transfer = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Saturation", f)) g_color_strength = f;
-    if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_effect_strength = f;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_controls.effect_strength = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoPaperWhite", v)) g_auto_pw = (v != 0);
+    if (g_controls.ensure_visible_strength()) {
+        logf("[NRPRE] settings repair: enabled NR had zero EffectStrength; restored to 1.0");
+        reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength",
+                                  g_controls.effect_strength);
+    }
     if (g_auto_pw && g_pw_valid) return;   // already converged, keep it
     logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f "
          "strength=%.3f transfer=%.3f intensity=%.3f rebind=%d",
-         (int)g_nr_enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee,
-         g_effect_strength, g_transfer, g_intensity, (int)g_rebind);
+         (int)g_controls.enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee,
+         g_controls.effect_strength, g_transfer, g_intensity, (int)g_rebind);
 }
 // Paper white shifts what the network is shown, so a preset nudges it rather than
 // setting it: auto exposure owns the absolute value, this only biases it.
@@ -2512,12 +2547,12 @@ static void apply_preset(int p) {
 }
 
 static void save_settings(reshade::api::effect_runtime *rt) {
-    reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_nr_enabled ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_controls.enabled ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
     reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
     reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
-    reshade::set_config_value(rt, "NRPreUpscale", "Diagnostics", g_diagnostics ? 1 : 0);
+    reshade::set_config_value(rt, "NRPreUpscale", "DeveloperDiagnostics", g_diagnostics ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "DeltaAdvect", g_delta_advect ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "DeltaAgeScale", g_delta_age_scale ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "SkipPassthrough", g_skip_passthrough ? 1 : 0);
@@ -2531,7 +2566,7 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Preset", g_preset);
     reshade::set_config_value(rt, "NRPreUpscale", "Transfer", g_transfer);
     reshade::set_config_value(rt, "NRPreUpscale", "Saturation", g_color_strength);
-    reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength", g_effect_strength);
+    reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength", g_controls.effect_strength);
     reshade::set_config_value(rt, "NRPreUpscale", "Codec", g_codec_on ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "AutoMask", g_auto_mask ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "PaperWhite", g_paper_white);
@@ -2545,9 +2580,14 @@ static void save_settings(reshade::api::effect_runtime *rt) {
 
 #ifndef NR_STANDALONE
 static void draw_overlay(reshade::api::effect_runtime *rt) {
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     bool changed = false;
 
-    changed |= ImGui::Checkbox("Enable DLSS-NR", &g_nr_enabled);
+    bool enabled = g_controls.enabled;
+    if (ImGui::Checkbox("Enable DLSS-NR", &enabled)) {
+        set_nr_enabled(enabled, "UI");
+        changed = true;
+    }
     ImGui::SetItemTooltip("Runs Neural Rendering on the DLSS input at render resolution, "
                           "instead of on the DLSS output, then feeds the result back in.");
 
@@ -2611,14 +2651,12 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     }
 
     ImGui::TextDisabled("How much of it is kept");
-    changed |= ImGui::SliderFloat("Effect strength", &g_effect_strength, 0.0f, 2.0f, "%.2f");
-    ImGui::SetItemTooltip("How far to carry the network's result. 0 is the game's own image, "
-                          "1 is the full effect, and above 1 pushes past what the network "
-                          "produced -- which sharpens, and can ring on hard edges. This "
-                          "dilutes everything evenly; the setting above shapes what the "
-                          "network does instead.");
-    if (g_effect_strength == 0.0f && g_codec_on)
-        ImGui::TextDisabled("Effect strength is zero: the NR effect is not visible.");
+    changed |= ImGui::SliderFloat("Effect strength", &g_controls.effect_strength, 0.05f, 2.0f, "%.2f");
+    ImGui::SetItemTooltip("How far to carry the network's result. 1 is the full effect, and "
+                           "above 1 pushes past what the network "
+                           "produced -- which sharpens, and can ring on hard edges. This "
+                           "dilutes everything evenly; the setting above shapes what the "
+                           "network does instead.");
 
 
     ImGui::Spacing();
@@ -2655,6 +2693,11 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     if (ImGui::CollapsingHeader("Advanced")) {
         ImGui::TextDisabled("Defaults are what the tuning converged on. Change them only to "
                             "trade one artefact for another.");
+        ImGui::Spacing();
+
+        changed |= ImGui::Checkbox("Developer diagnostics", &g_diagnostics);
+        ImGui::SetItemTooltip("Adds synchronous GPU readback and frequent log writes. Enable "
+                              "only while collecting a diagnostic trace.");
         ImGui::Spacing();
 
         ImGui::SeparatorText("Colour development");
@@ -2730,23 +2773,54 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::SeparatorText("Status");
     if (g_ui_fps > 0.0f) {
         ImGui::Text("%.2f ms   %.0f fps", g_ui_ms, g_ui_fps);
-        if (g_nr_enabled && g_ui_base_ms > 0.0f)
+        if (g_controls.enabled && g_ui_base_ms > 0.0f)
             ImGui::Text("NR cost %.2f ms   network at %.0f Hz",
                         g_ui_ms - g_ui_base_ms, g_ui_nr_hz);
-        else if (g_nr_enabled)
+        else if (g_controls.enabled)
             ImGui::TextDisabled("Toggle off once to measure the NR cost.");
     } else {
         ImGui::TextDisabled("Waiting for frames...");
     }
-    if (g_resize_pending)
+    if (g_submission_failed)
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.2f, 1.0f),
+                           "NR is in fail-safe passthrough after submission tracking failed; restart the game");
+    else if (g_resize_pending)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "NR paused while previous GPU work finishes");
     else if (g_nr_handle == nullptr)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Network not created yet");
 
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults")) {
-        g_nr_enabled = true; g_skip_n = 1; g_codec_on = true;
-        g_paper_white = 1.0f; g_knee = 0.75f;
+        g_controls.reset_defaults();
+        g_skip_n = 1;
+        g_net_scale = 1.0f;
+        g_async_net = false;
+        g_uniform_delta = true;
+        g_diagnostics = false;
+        g_delta_advect = false;
+        g_delta_age_scale = false;
+        g_skip_passthrough = true;
+        g_delta_reuse = true;
+        g_delta_clamp = 0.25f;
+        g_reproject = 1.0f;
+        g_depth_reject = 0.02f;
+        g_struct_gate = 1.0f;
+        g_chroma_transfer = 0.0f;
+        g_input_gain = 1.0f;
+        g_preset = 3;
+        g_transfer = 1.0f;
+        g_color_strength = 1.0f;
+        g_codec_on = true;
+        g_auto_mask = true;
+        g_paper_white = 1.0f;
+        g_knee = 0.75f;
+        g_skin_structure = -1.0f;
+        g_local_structure = 0.70f;
+        g_local_tone = 0.15f;
+        g_intensity = 1.0f;
+        g_auto_pw = false;
+        reset_temporal_history();
+        logf("[NRPRE] UI: settings reset to defaults; temporal history cleared");
         changed = true;
     }
     ImGui::SameLine();
@@ -3270,10 +3344,10 @@ static void install_hook() {
     }
     if (n == 0) return;                                    // nothing loaded yet, retry next present
 
-    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
+    const MH_STATUS init_status = MH_Initialize();
+    if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED) {
         logf("[NRPRE] MH_Initialize failed"); return;
     }
-    g_hooked = true;                                       // only ever try once
 
     unsigned ok = 0;
     for (unsigned i = 0; i < n; ++i) {
@@ -3288,32 +3362,56 @@ static void install_hook() {
             continue;
         }
         const auto install_contract_hook = [](FARPROC address, void *hook, void **original) {
-            if (MH_CreateHook(reinterpret_cast<void *>(address), hook, original) != MH_OK)
+            const MH_STATUS create_status =
+                MH_CreateHook(reinterpret_cast<void *>(address), hook, original);
+            if (create_status != MH_OK &&
+                (create_status != MH_ERROR_ALREADY_CREATED || *original == nullptr))
                 return false;
-            if (MH_EnableHook(reinterpret_cast<void *>(address)) == MH_OK) return true;
-            MH_RemoveHook(reinterpret_cast<void *>(address));
-            *original = nullptr;
+            const MH_STATUS enable_status = MH_EnableHook(reinterpret_cast<void *>(address));
+            if (enable_status == MH_OK || enable_status == MH_ERROR_ENABLED) return true;
+            if (create_status == MH_OK) {
+                MH_RemoveHook(reinterpret_cast<void *>(address));
+                *original = nullptr;
+            }
             return false;
         };
-        if (!install_contract_hook(release, reinterpret_cast<void *>(kReleaseThunks[i]),
-                                   reinterpret_cast<void **>(&g_orig_release_n[i])) ||
-            !install_contract_hook(create, reinterpret_cast<void *>(kCreateThunks[i]),
-                                   reinterpret_cast<void **>(&g_orig_create_n[i]))) {
+        const auto remove_contract_hook = [](FARPROC address, void **original) {
+            if (*original == nullptr) return;
+            MH_DisableHook(reinterpret_cast<void *>(address));
+            MH_RemoveHook(reinterpret_cast<void *>(address));
+            *original = nullptr;
+        };
+        const bool release_on = install_contract_hook(
+            release, reinterpret_cast<void *>(kReleaseThunks[i]),
+            reinterpret_cast<void **>(&g_orig_release_n[i]));
+        const bool create_on = release_on && install_contract_hook(
+            create, reinterpret_cast<void *>(kCreateThunks[i]),
+            reinterpret_cast<void **>(&g_orig_create_n[i]));
+        if (!release_on || !create_on) {
+            remove_contract_hook(create, reinterpret_cast<void **>(&g_orig_create_n[i]));
+            remove_contract_hook(release, reinterpret_cast<void **>(&g_orig_release_n[i]));
             logf("[NRPRE] feature gate: lifecycle hook unavailable for module %u; leaving evaluate untouched", i);
             continue;
         }
         logf("[NRPRE] feature gate: CreateFeature/ReleaseFeature hooks active (module %u)", i);
-        if (MH_CreateHook(reinterpret_cast<LPVOID>(target),
-                          const_cast<LPVOID>(kEvalThunks[i]),
-                          reinterpret_cast<LPVOID *>(&g_orig_eval_n[i])) != MH_OK) continue;
-        const bool on = MH_EnableHook(reinterpret_cast<LPVOID>(target)) == MH_OK;
+        const bool on = install_contract_hook(
+            target, const_cast<LPVOID>(kEvalThunks[i]),
+            reinterpret_cast<LPVOID *>(&g_orig_eval_n[i]));
         wchar_t path[MAX_PATH] = {};
         GetModuleFileNameW(cands[i], path, MAX_PATH);
         logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S",
              i, on ? "OK" : "FAILED", path);
-        if (on) { ++ok; if (g_orig_eval == nullptr) g_orig_eval = g_orig_eval_n[i]; }
+        if (on) {
+            ++ok;
+            if (g_orig_eval == nullptr) g_orig_eval = g_orig_eval_n[i];
+        } else {
+            remove_contract_hook(target, reinterpret_cast<void **>(&g_orig_eval_n[i]));
+            remove_contract_hook(create, reinterpret_cast<void **>(&g_orig_create_n[i]));
+            remove_contract_hook(release, reinterpret_cast<void **>(&g_orig_release_n[i]));
+        }
     }
     if (ok == 0) { logf("[NRPRE] no NGX evaluate could be hooked"); return; }
+    g_hooked = true;                                       // at least one complete hook set is active
 
 }
 
@@ -3325,7 +3423,7 @@ static void on_init_swapchain(reshade::api::swapchain *, bool resize) {
     if (!resize) return;
     release_state("swapchain recreated");
     g_force_reset_frames = 8;       // flush the network's history afterwards
-    g_diag_frames = 90;
+    g_diag_frames = g_diagnostics ? 90 : 0;
 }
 
 static void on_destroy_device(reshade::api::device *dev) {
@@ -3367,15 +3465,14 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     service_pending_cleanup();
     static bool prev_down = false;
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (down && !prev_down) {
-        g_nr_enabled = !g_nr_enabled;
-        logf("[NRPRE] F7: DLSS-NR %s", g_nr_enabled ? "ON" : "OFF");
-    }
+    if (down && !prev_down)
+        set_nr_enabled(!g_controls.enabled, "F7");
     prev_down = down;
 
     // F10 stamps the log so a visual event can be located exactly: the breakage
     // leaves no DXGI or state trace, so the timestamp has to come from the user.
-    // F6 cycles the effect between normal, exaggerated and off.
+    // F6 switches between normal and exaggerated strength. It deliberately never
+    // stores zero: F7 owns ON/OFF, so the two controls cannot contradict each other.
     //
     // Without an overlay there is no way to see whether the network is doing
     // anything, and "is it on?" is not a question a subtle effect can answer. The
@@ -3386,12 +3483,11 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     static bool ex_prev = false;
     const bool ex_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
     if (ex_down && !ex_prev) {
-        g_effect_strength = (g_effect_strength > 2.0f)  ? 0.0f
-                          : (g_effect_strength < 0.01f) ? 1.0f
-                                                        : 3.0f;
-        logf("[NRPRE] F6: EffectStrength = %.1f  (%s)", g_effect_strength,
-             g_effect_strength > 2.0f  ? "EXAGERADO -- si no se nota, no llega a pantalla" :
-             g_effect_strength < 0.01f ? "apagado" : "normal");
+        g_controls.cycle_diagnostic_strength();
+        logf("[NRPRE] F6: EffectStrength = %.1f  (%s)", g_controls.effect_strength,
+             g_controls.effect_strength > 2.0f
+                 ? "EXAGERADO -- si no se nota, no llega a pantalla"
+                 : "normal");
     }
     ex_prev = ex_down;
 
@@ -3405,7 +3501,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
              ++mark_no, g_paper_white, g_pw_measured, (int)g_pw_valid, g_pw_updates,
              g_hdr_mode, (int)g_hdr_detected, g_knee, g_exp_fresh, (int)g_exp_from_game,
              g_skip_n, g_net_w, g_net_h, (int)g_final_valid, (int)g_codec_on,
-             (int)g_nr_enabled, g_phase);
+             (int)g_controls.enabled, g_phase);
         ring_dump("F10");   // what came BEFORE the key: no one reacts inside a frame
         g_jit_burst = 40;
     }

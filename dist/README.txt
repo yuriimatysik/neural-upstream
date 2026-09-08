@@ -62,7 +62,11 @@ Quality costs the same in total, spread evenly, and paces cleanly at 4x.
 
 IF SOMETHING LOOKS WRONG
 ------------------------
-Set Diagnostics=1 in ReShade.ini, under [NRPreUpscale], and the add-on writes
-what it is doing to ReShade.log: per-stage GPU times, and a count of failed
-evaluates and frames that passed through untouched. It is off by default because
-the logging itself sits on the present thread and can cost a frame.
+Enable Developer diagnostics under Advanced in the ReShade overlay, and the
+add-on writes what it is doing to ReShade.log: per-stage GPU times, and a count
+of failed evaluates and frames that passed through untouched. It is off by
+default because its GPU readback and logging sit on the present thread and can
+cost a frame.
+
+F7 toggles NR and clears its temporal history when turning it back on. F6 switches
+Effect strength between normal (1) and exaggerated diagnostic strength (3).

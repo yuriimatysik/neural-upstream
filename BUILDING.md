@@ -120,7 +120,7 @@ Compilation and export checks do not establish game compatibility. Test:
     setting explicitly. Final confirmation of the 4x flicker fix with nonzero
     strength remains outstanding.
 12. `visibility diagnostics v1` records `strength`, `transfer`, `enabled` and
-    `nested_dlss_bypass` in heartbeats (Diagnostics enabled). Loaded settings also
+    `nested_dlss_bypass` in heartbeats (Developer diagnostics enabled). Loaded settings also
     include intensity and rebind. First confirm Effect strength is 1 and Transfer
     is nonzero: these are saved in ReShade.ini across binary changes. If the
     effect is still absent, compare F7 on/off and capture the diagnostic log.

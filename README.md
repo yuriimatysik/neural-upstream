@@ -1,8 +1,58 @@
 # neural-upstream
 
-This fork combines the Stellar Blade fixes from upstream issue #3 with the
-community-runtime fixes in PR #4. See [BUILDING.md](BUILDING.md) for pinned
-dependencies, automated Windows DLL builds, installation and GPU test coverage.
+## What this fork adds
+
+This fork builds on the original neural-upstream project and the community's
+compatibility fixes, with additional fixes for stability and frame generation.
+**MFG 4x works well in testing, including on RTX 40-series GPUs using the MFG 4x
+unlock mod.**
+
+### Bug fixes
+
+- **NR interfering with frame generation:** restrict NR processing to DLSS
+  upscaling and Ray Reconstruction features, bypassing frame-generation and
+  unknown NGX features so their inputs are not modified.
+- **GPU descriptors reused while still in flight:** keep descriptor slots owned
+  by their command-list recordings until every submitting queue has finished,
+  preventing later frames from overwriting descriptors the GPU still needs.
+- **NR getting stuck after resize or alt-tab:** track native and wrapped command
+  lists through submission, reset and destruction so cleanup can finish and NR
+  can resume safely.
+- **Unstable depth guides and stalled cadence:** use the game's DLSS depth
+  convention instead of a changing screen sample, reset temporal history when
+  that convention changes, and recover when jitter stops advancing.
+
+It also includes the earlier Stellar Blade and community Ada-runtime fixes:
+correct resource dimensions and typed texture views, explicit NR input/output
+geometry, a fallback when the scratch-buffer query fails, safe resource cleanup
+during resolution changes, and preservation of the live NR enabled state.
+
+### Tested games
+
+The fork maintainer has tested the following games with **no flicker observed**:
+
+- GTA V
+- Forza Horizon 6 — Xbox app version
+- Assassin's Creed Black Flag Resynced
+- Avatar: Frontiers of Pandora
+
+These are the results reported so far for this fork. For frame generation, use
+the **Quality** cadence setting described below.
+
+### Thanks and credits
+
+Thank you to **matiasLombo** for the [original neural-upstream project](https://github.com/matiasLombo/neural-upstream),
+**Yurii Matysik** for the [compatibility-fix fork](https://github.com/yuriimatysik/neural-upstream),
+**Devin Mesenbrink** for the community Ada-runtime fixes in
+[PR #4](https://github.com/matiasLombo/neural-upstream/pull/4), and everyone who
+contributed testing, research and bug reports, including
+[Stellar Blade issue #3](https://github.com/matiasLombo/neural-upstream/issues/3).
+Their work made this fork possible.
+
+See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
+builds, installation and detailed validation notes.
+
+## About neural-upstream
 
 DLSS 5 Neural Rendering runs at output resolution, after the upscaler. This
 ReShade add-on moves it **upstream**: the network runs on the game's
@@ -13,8 +63,8 @@ The network is same-resolution only — it enhances, it does not upscale — so
 running it on the smaller image costs proportionally less and the upscaler still
 does the job it was going to do anyway.
 
-Built and tested against GTA V Enhanced and the Bright Memory: Infinite
-benchmark.
+The original project was built and tested against GTA V Enhanced and the
+Bright Memory: Infinite benchmark; this fork's testing is listed above.
 
 ## How it works
 

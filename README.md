@@ -1,8 +1,58 @@
 # neural-upstream
 
-This fork combines the Stellar Blade fixes from upstream issue #3 with the
-community-runtime fixes in PR #4. See [BUILDING.md](BUILDING.md) for pinned
-dependencies, automated Windows DLL builds, installation and GPU test coverage.
+## What this fork adds
+
+This fork builds on the original neural-upstream project and the community's
+compatibility fixes, with additional fixes for stability and frame generation.
+**MFG 4x works well in testing, including on RTX 40-series GPUs using the MFG 4x
+unlock mod.**
+
+### Bug fixes
+
+- **NR interfering with frame generation:** restrict NR processing to DLSS
+  upscaling and Ray Reconstruction features, bypassing frame-generation and
+  unknown NGX features so their inputs are not modified.
+- **GPU descriptors reused while still in flight:** keep descriptor slots owned
+  by their command-list recordings until every submitting queue has finished,
+  preventing later frames from overwriting descriptors the GPU still needs.
+- **NR getting stuck after resize or alt-tab:** track native and wrapped command
+  lists through submission, reset and destruction so cleanup can finish and NR
+  can resume safely.
+- **Unstable depth guides and stalled cadence:** use the game's DLSS depth
+  convention instead of a changing screen sample, reset temporal history when
+  that convention changes, and recover when jitter stops advancing.
+
+It also includes the earlier Stellar Blade and community Ada-runtime fixes:
+correct resource dimensions and typed texture views, explicit NR input/output
+geometry, a fallback when the scratch-buffer query fails, safe resource cleanup
+during resolution changes, and preservation of the live NR enabled state.
+
+### Tested games
+
+The fork maintainer has tested the following games with **no flicker observed**:
+
+- GTA V
+- Forza Horizon 6 — Xbox app version
+- Assassin's Creed Black Flag Resynced
+- Avatar: Frontiers of Pandora
+
+These are the results reported so far for this fork. For frame generation, use
+the **Quality** cadence setting described below.
+
+### Thanks and credits
+
+Thank you to **matiasLombo** for the [original neural-upstream project](https://github.com/matiasLombo/neural-upstream),
+**Yurii Matysik** for the [compatibility-fix fork](https://github.com/yuriimatysik/neural-upstream),
+**Devin Mesenbrink** for the community Ada-runtime fixes in
+[PR #4](https://github.com/matiasLombo/neural-upstream/pull/4), and everyone who
+contributed testing, research and bug reports, including
+[Stellar Blade issue #3](https://github.com/matiasLombo/neural-upstream/issues/3).
+Their work made this fork possible.
+
+See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
+builds, installation and detailed validation notes.
+
+## About neural-upstream
 
 DLSS 5 Neural Rendering runs at output resolution, after the upscaler. This
 ReShade add-on moves it **upstream**: the network runs on the game's
@@ -13,8 +63,8 @@ The network is same-resolution only — it enhances, it does not upscale — so
 running it on the smaller image costs proportionally less and the upscaler still
 does the job it was going to do anyway.
 
-Built and tested against GTA V Enhanced and the Bright Memory: Infinite
-benchmark.
+The original project was built and tested against GTA V Enhanced and the
+Bright Memory: Infinite benchmark; this fork's testing is listed above.
 
 ## How it works
 
@@ -33,6 +83,30 @@ leaves hue and saturation exactly as the game rendered them.
 Reference white for that normalisation is read from the game's own exposure
 buffer on a dedicated copy queue, so it tracks day and night without a fixed
 value tuned by hand.
+
+**Highlight and detail controls.** `Highlight curve` defaults to **Preserve
+highlights**: a gradual shoulder retains more differences between bright values
+in the FP16 network input, with gamut compression to keep saturated colours in
+range. **Legacy** selects the previous exponential shoulder and colour handling.
+This changes what the network sees; visual improvement still needs comparison
+in each game.
+
+`Detail strength` adjusts fine variations in the network's luminance gain;
+`Lighting strength` adjusts its locally averaged component. Both default to
+**1.00**, which uses the original gain transfer without neighbourhood filtering.
+Non-default values use an edge-weighted five-tap estimate; extra detail gain is
+limited to a quarter stop and the overall gain remains within 1/8 to 8. This is
+a local approximation of lighting versus detail, not a semantic separation.
+Both direct and reused-frame decode apply the same adjustment. Its GPU cost
+has not yet been measured.
+
+For comparison, keep cadence **Quality**, one network pass, and effect/transfer
+at **1.00**. First compare the two curves with detail and lighting at **1.00**;
+then try detail **1.15**, keeping lighting at **1.00**. Compare a stationary scene
+and camera motion, including bright textures, foliage and skin. Changing these
+controls resets NR history and cached output; allow it to settle before comparing.
+Settings persist as `EncodeCurve` (0 legacy, 1 preserve highlights),
+`DetailStrength` (0–2) and `LightingStrength` (0–1.5) in `[NRPreUpscale]`.
 
 **Cadence.** The network can run less often than every frame. The choice of which
 frame is anchored to the DLSS jitter rather than to a count of calls, because the
@@ -101,8 +175,8 @@ measured rather than guessed. On an RTX 4070 Ti at 1280x720 render resolution:
 | colour decode | 0.017 ms |
 
 The network is 99% of it, and about a third of a 100 fps frame. The colour
-pipeline is free by comparison, so there is nothing worth optimising on this
-side — cadence is the only lever that moves the number.
+pipeline is small by comparison at the original transfer settings. These timings
+predate the optional neighbourhood detail adjustment; measure its cost separately.
 
 ## Status
 

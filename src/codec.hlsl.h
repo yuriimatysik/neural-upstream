@@ -28,7 +28,10 @@ cbuffer K : register(b0) {
   float  StructGate;   // how much local structure must justify the reused effect
   float  EffectStrength;  // how far to carry the network's result, 1 = all of it
   float  ChromaTransfer;  // how much of the network's own colour to adopt
-  float  Pad4;
+  uint   EncodeCurve;    // 0 = legacy, 1 = gradual highlight shoulder
+  float  DetailStrength; // 1 = unchanged local gain variation
+  float  LightingStrength; // 1 = unchanged smooth gain
+  float2 Padding;
 };
 
 float Luminance(float3 c) { return dot(c, float3(0.212639, 0.715169, 0.072192)); }
@@ -62,7 +65,7 @@ float3 SrgbDecode(float3 c) {
 // are not a luminance gain. ChromaTransfer brings them back on demand, applied
 // as a direction at the luminance we already restored, so the range still comes
 // from the original and only the hue follows the network.
-float3 RestoreRange(float3 original, float3 proxy, float3 neural) {
+float3 RestoreRange(float3 original, float3 proxy, float3 neural, float gain) {
   const float oy = Luminance(original);
   const float py = Luminance(proxy);
   const float ny = Luminance(neural);
@@ -70,8 +73,6 @@ float3 RestoreRange(float3 original, float3 proxy, float3 neural) {
   // denominator turns shadow noise into blown pixels -- so leave those alone.
   if (py <= 1e-5 || oy <= 1e-5) return original;
 
-  const float kGainLimit = 8.0;
-  const float gain = clamp(ny / py, 1.0 / kGainLimit, kGainLimit);
   float3 lit = original * gain;
 
   if (ChromaTransfer > 0.0 && ny > 1e-5) {
@@ -81,6 +82,38 @@ float3 RestoreRange(float3 original, float3 proxy, float3 neural) {
   return lerp(original, lit, TransferStrength);
 }
 
+
+// C1-continuous at the knee; the rational tail retains distinctions between
+// highlights that the legacy exponential maps to the same FP16 white value.
+float HighlightShoulder(float y, float knee, uint curve) {
+  const float k = clamp(knee, 0.05, 0.99);
+  if (y <= k) return y;
+  const float span = 1.0 - k;
+  const float t = y - k;
+  if (curve == 0)
+    return k + span * (1.0 - exp(-(5.770780 * 0.25 / span) * t));
+  return k + span * (t / (span + t));
+}
+
+// Move toward neutral only as far as needed to fit the brightest channel.
+// This keeps luminance and the chroma direction, avoiding a per-channel clip.
+float GamutChromaScale(float y, float peak) {
+  return peak > 1.0 ? saturate((1.0 - y) / max(peak - y, 1e-6)) : 1.0;
+}
+
+float LuminanceGain(float py, float ny) {
+  return py <= 1e-5 ? 1.0 : clamp(ny / py, 0.125, 8.0);
+}
+
+// Work in stops so the broad lighting change and local detail are additive.
+// Detail amplification is limited to a quarter stop; attenuation may remove the
+// entire fine component. The overall legacy gain cap remains.
+float ShapeLogGain(float center, float base, float detail, float lighting) {
+  const float fine = center - base;
+  float extra = (detail - 1.0) * fine;
+  if (detail > 1.0) extra = clamp(extra, -0.25, 0.25);
+  return clamp(center + (lighting - 1.0) * base + extra, -3.0, 3.0);
+}
 
 // scene-linear HDR -> bounded display-referred sRGB that DLSSNR can consume
 [numthreads(16, 16, 1)]
@@ -100,47 +133,23 @@ void CSEncode(uint3 tid : SV_DispatchThreadID) {
   // changes the ratio between channels -- that is a hue shift, and the network
   // then bakes it in. Scaling the colour by the luminance ratio keeps hue and
   // relative chroma exactly.
-  const float k = clamp(Knee, 0.05, 0.99);
-  const float span = 1.0 - k;
   const float y = Luminance(c);
-  const float y_out = (y <= k) ? y : (k + span * (1.0 - exp(-(5.770780 * 0.25 / span) * (y - k))));
+  const float y_out = HighlightShoulder(y, Knee, EncodeCurve);
   c *= y_out / max(y, 1e-6);
   // A very saturated colour can still push a channel past 1.0. Pull it back
   // towards its luminance rather than letting saturate() clip one channel and
-  // skew the hue -- but only for genuine overshoot, and only partially: the
-  // full-strength version desaturated the whole frame whenever the exposure
-  // estimate ran hot.
+  // skew the hue. The new curve fits the chroma to the available headroom;
+  // legacy mode retains its partial correction for an unchanged A/B baseline.
   const float peak = max(c.r, max(c.g, c.b));
   if (peak > 1.0) {
-    const float t = saturate((peak - 1.0) / 3.0) * 0.5;   // gentle, capped at 50%
-    c = lerp(c, y_out.xxx, t);
+    if (EncodeCurve != 0) {
+      c = y_out.xxx + (c - y_out.xxx) * GamutChromaScale(y_out, peak);
+    } else {
+      const float t = saturate((peak - 1.0) / 3.0) * 0.5;   // gentle, capped at 50%
+      c = lerp(c, y_out.xxx, t);
+    }
   }
   Output[tid.xy] = float4(SrgbEncode(c), src.a);
-}
-
-// DLSSNR output -> back to the game's scene-linear HDR range
-[numthreads(16, 16, 1)]
-void CSDecode(uint3 tid : SV_DispatchThreadID) {
-  if (any(tid.xy >= Size)) return;
-  float4 src = Original.Load(int3(tid.xy, 0));
-  const float pw = max(PaperWhiteScale, 1e-4);
-  float3 original = max(src.rgb, 0.0);
-  float3 proxy    = SrgbDecode(Proxy.Load(int3(tid.xy, 0)).rgb);
-  // saturate() is not cosmetic. CSApplyDelta clamps its reconstructed
-  // neural_enc to [0,1]; without the same clamp here the two paths disagree
-  // wherever the encoded value passes 1.0 -- the highlights, on HDR content.
-  // At any cadence above 1 those two paths alternate frame by frame, so a
-  // difference that exists on only one of them reads as flicker, on exactly
-  // the pixels the eye is drawn to. Clip both or clip neither.
-  float3 neural   = SrgbDecode(saturate(Neural.Load(int3(tid.xy, 0)).rgb));
-  if (HdrMode == 2) { proxy *= pw; neural *= pw; }
-  float3 result = RestoreRange(original, proxy, neural);
-  const float luma_only = Luminance(result);
-  result = lerp(luma_only.xxx, result, ColorStrength == 0.0 ? 1.0 : ColorStrength);
-  // Dial the whole thing back toward the image the game handed us. Done here, at
-  // the end, it applies to the real result and the reconstructed one alike.
-  result = lerp(original, result, EffectStrength);
-  Output[tid.xy] = float4(result, src.a);
 }
 
 // --- Cadence support: reuse the network's *effect*, not its output ------------
@@ -181,21 +190,21 @@ float3 DeltaInPlace(uint2 px) {
   return here.rgb * keep;
 }
 
-[numthreads(16, 16, 1)]
-void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
-  if (any(tid.xy >= Size)) return;
-  float4 src = Original.Load(int3(tid.xy, 0));
-  const float pw = max(PaperWhiteScale, 1e-4);
-  const float3 proxy_enc = Proxy.Load(int3(tid.xy, 0)).rgb;
+// Both decode paths share reconstruction and detail shaping. Neighbour taps on
+// skipped frames must reproject too; reading the stored delta in place would
+// put a second, misaligned set of edges into the detail estimate.
+float3 ReconstructedNeural(uint2 px, bool reused) {
+  if (!reused) return saturate(Neural.Load(int3(px, 0)).rgb);
+  const float3 proxy_enc = Proxy.Load(int3(px, 0)).rgb;
   // The delta was measured at last frame's pixel positions, so on a moving camera
   // it sits where the edges *were*: reapplied in place that reads as ghosting.
   // Follow the motion vector back to where this pixel was and take the delta from
   // there. Outside the frame there is no history, so contribute nothing rather
   // than something wrong.
-  float3 delta;
+  float3 delta = 0.0;
   if (Reproject != 0.0) {
-    const float2 mv = MVec.Load(int3(tid.xy, 0)).xy * MvScale;
-    const float2 prev = float2(tid.xy) + mv * Reproject;
+    const float2 mv = MVec.Load(int3(px, 0)).xy * MvScale;
+    const float2 prev = float2(px) + mv * Reproject;
     const bool inside = !(any(prev < 0.0) || any(prev >= float2(Size) - 1.0));
     float wsum = 0.0;
     if (inside) {
@@ -213,7 +222,7 @@ void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
       // to a perfectly valid coordinate -- the delta waiting there just belongs to
       // whatever used to occlude it. Depth is what separates the two: keep only the
       // taps still sitting on this pixel's surface, and reweight what is left.
-      const float dcur = DepthTex.Load(int3(tid.xy, 0)).x;
+      const float dcur = DepthTex.Load(int3(px, 0)).x;
       const float tol  = max(DepthReject, 0.0);
       float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
                         (1.0 - f.x) * f.y,         f.x * f.y);
@@ -242,7 +251,7 @@ void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
         float lo = lc, hi = lc;
         [unroll] for (int dy = -1; dy <= 1; ++dy)
           [unroll] for (int dx = -1; dx <= 1; ++dx) {
-            const int2 q = clamp(int2(tid.xy) + int2(dx, dy), int2(0, 0), int2(Size) - 1);
+            const int2 q = clamp(int2(px) + int2(dx, dy), int2(0, 0), int2(Size) - 1);
             const float l = Luminance(Proxy.Load(int3(q, 0)).rgb);
             lo = min(lo, l); hi = max(hi, l);
           }
@@ -260,25 +269,66 @@ void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
       }
         }
     }
-    if (!inside || wsum < 1e-4) delta = DeltaInPlace(tid.xy);
+    if (!inside || wsum < 1e-4) delta = DeltaInPlace(px);
   } else {
-    delta = Neural.Load(int3(tid.xy, 0)).rgb;       // Neural slot holds the delta
+    delta = Neural.Load(int3(px, 0)).rgb;       // Neural slot holds the delta
   }
   const float cap = max(DeltaClamp, 0.0);
   if (cap > 0.0) delta = clamp(delta, -cap, cap);
-  const float3 neural_enc = saturate(proxy_enc + delta);
+  return saturate(proxy_enc + delta);
+}
 
-  float3 original = max(src.rgb, 0.0);
-  float3 proxy    = SrgbDecode(proxy_enc);
-  float3 neural   = SrgbDecode(neural_enc);
+float DetailGain(uint2 px, float py, float ny, bool reused) {
+  const float gain = LuminanceGain(py, ny);
+  // Exact legacy fast path: no neighbourhood reads or log/exp round trip.
+  if (DetailStrength == 1.0 && LightingStrength == 1.0) return gain;
+  if (py <= 1e-5) return gain;
+  const float center = log2(gain);
+  const float lc = Luminance(Proxy.Load(int3(px, 0)).rgb);
+  const float pw = HdrMode == 2 ? max(PaperWhiteScale, 1e-4) : 1.0;
+  float sum = center * 4.0, weights = 4.0;
+  const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+  [unroll] for (int i = 0; i < 4; ++i) {
+    const int2 q = clamp(int2(px) + offsets[i], int2(0, 0), int2(Size) - 1);
+    const float3 penc = Proxy.Load(int3(q, 0)).rgb;
+    const float qpy = Luminance(SrgbDecode(penc)) * pw;
+    const float qoy = Luminance(max(Original.Load(int3(q, 0)).rgb, 0.0));
+    // Do not mix unrelated edges or undefined shadow gains into the base.
+    const float w = saturate(1.0 - abs(Luminance(penc) - lc) / 0.1);
+    if (w > 0.0 && qpy > 1e-5 && qoy > 1e-5) {
+      const float qny = Luminance(SrgbDecode(ReconstructedNeural(uint2(q), reused))) * pw;
+      sum += log2(LuminanceGain(qpy, qny)) * w;
+      weights += w;
+    }
+  }
+  return exp2(ShapeLogGain(center, sum / weights, DetailStrength, LightingStrength));
+}
+
+void DecodePixel(uint2 px, bool reused) {
+  const float4 src = Original.Load(int3(px, 0));
+  const float pw = max(PaperWhiteScale, 1e-4);
+  const float3 original = max(src.rgb, 0.0);
+  float3 proxy = SrgbDecode(Proxy.Load(int3(px, 0)).rgb);
+  float3 neural = SrgbDecode(ReconstructedNeural(px, reused));
   if (HdrMode == 2) { proxy *= pw; neural *= pw; }
-  float3 result = RestoreRange(original, proxy, neural);
+  const float gain = DetailGain(px, Luminance(proxy), Luminance(neural), reused);
+  float3 result = RestoreRange(original, proxy, neural, gain);
   const float luma_only = Luminance(result);
   result = lerp(luma_only.xxx, result, ColorStrength == 0.0 ? 1.0 : ColorStrength);
-  // Dial the whole thing back toward the image the game handed us. Done here, at
-  // the end, it applies to the real result and the reconstructed one alike.
   result = lerp(original, result, EffectStrength);
-  Output[tid.xy] = float4(result, src.a);
+  Output[px] = float4(result, src.a);
+}
+
+[numthreads(16, 16, 1)]
+void CSDecode(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  DecodePixel(tid.xy, false);
+}
+
+[numthreads(16, 16, 1)]
+void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  DecodePixel(tid.xy, true);
 }
 
 // Carry the stored effect forward by exactly one frame.

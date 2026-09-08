@@ -2,6 +2,8 @@ name: Build Windows DLLs
 on:
   push:
   pull_request:
+  release:
+    types: [created, published]
   workflow_dispatch:
 
 permissions:
@@ -39,6 +41,30 @@ jobs:
           name: neural-upstream-windows-x64
           if-no-files-found: error
           path: |
+            nvngx.dll.addon64
+            proxy/nvngx.dll.nr
+            proxy/version.dll
+            SHA256SUMS
+            BUILDING.md
+            LICENSE
+            external/minhook/LICENSE.txt
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: neural-upstream-windows-x64
+      - name: Attach the build to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: true
+          files: |
             nvngx.dll.addon64
             proxy/nvngx.dll.nr
             proxy/version.dll

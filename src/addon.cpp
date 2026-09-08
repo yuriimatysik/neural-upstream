@@ -1015,7 +1015,15 @@ static NVSDK_NGX_Handle *g_nr_handle_hi = nullptr;
 static ID3D12Resource   *g_nr_out_hi = nullptr;
 static NVSDK_NGX_Parameter *g_nr_params_hi = nullptr;
 static bool              g_use_hi = false;        // F8
-static int               g_repeat = 1;            // F9: run NR N times per frame
+static int               g_repeat = 1;            // how many times the network is applied
+// Chained passes stage each result into this buffer and the next pass reads the
+// copy. A texture cannot read and write itself at once, and the network's
+// D3D12 backend did not tolerate a buffer it had just written being handed
+// back as an input in the same frame (E_INVALIDARG on the first multi-pass
+// frame), so the copy is what makes the chain safe: the network's output stays
+// 'out' on every pass, and 'stage' is only ever an input.
+static ID3D12Resource   *g_nr_stage = nullptr;
+static ID3D12Resource   *g_nr_stage_hi = nullptr;
 static bool              g_rebind = true;         // F10: feed NR output into DLSS (visible)
 // Every frame is the default: since the cadence anchors on the jitter, this is one
 // NR pass per frame in the pass that is actually shown. The old evaluate counter ran
@@ -1336,7 +1344,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             logf("[NRPRE] HB #%llu handle=%p | pw=%.4f meas=%.4f valid=%d upd=%u "
                  "| hdr=%u det=%d knee=%.3f kmeas=%.3f | expfresh=%u fromgame=%d "
                  "| net=%ux%u finalvalid=%d | enabled=%d strength=%.3f transfer=%.3f "
-                 "| cad=%d async=%d | erfail=%u grfail=%u passthru=%u "
+                 "| cad=%d rep=%d async=%d | erfail=%u grfail=%u passthru=%u "
                  "| depthinv=%d depthsrc=%s | descpages=%zu descbypass=%u descerr=%u "
                  "| fg_bypass=%llu unknown_bypass=%llu nested_dlss_bypass=%llu",
                  (unsigned long long)hb, (void *)g_nr_handle,
@@ -1345,7 +1353,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                  g_exp_fresh, (int)g_exp_from_game,
                  g_net_w, g_net_h, (int)g_final_valid,
                  (int)g_nr_enabled, g_effect_strength, g_transfer,
-                 g_skip_n, (int)g_async_net,   // which mode was actually running, always
+                 g_skip_n, (int)g_repeat, (int)g_async_net,   // which mode was actually running, always
                  g_er_fail, g_gr_fail, g_pass_frames,
                  (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback",
                  g_descriptor_pages.size(), g_descriptor_bypass, g_descriptor_invariant,
@@ -1577,6 +1585,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            const D3D12_RESOURCE_STATES kCS  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            const D3D12_RESOURCE_STATES kCD  = D3D12_RESOURCE_STATE_COPY_DEST;
 
             g_net_w = w_net; g_net_h = h_net;
 
@@ -1601,20 +1611,40 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                    g_cx.proxy, w_net, h_net);
                     uav_barrier(cmd, g_cx.proxy);
                     barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);   // NGX reads inputs as SRV
-                    pset_res(pp, "DLSSNR.Color", g_cx.proxy);
-                } else {
-                    pset_res(pp, "DLSSNR.Color", in);
                 }
 
-                // The braces are load-bearing: without them the loop covered only the
-                // first mark and the evaluate ran once regardless of g_repeat.
+                // Passes are chained, not repeated: each pass reads the previous
+                // pass's result, so the effect compounds instead of re-running the
+                // same input N times. The result is copied to 'stage' between
+                // passes: a texture cannot be its own input and output at once, and
+                // handing the network a buffer it just wrote in the same frame is
+                // what broke the D3D12 backend, so 'stage' is only ever an input
+                // and the network's output stays 'out' on every pass.
+                ID3D12Resource *stage = hi ? g_nr_stage_hi : g_nr_stage;
+                if (stage == nullptr) g_repeat = 1;
+                ID3D12Resource *cur_in = use_codec ? g_cx.proxy : in;
+                bool staged = false;
                 for (int k = 0; k < g_repeat; ++k) {
+                    pset_res(pp, "DLSSNR.Color",  cur_in);
+                    pset_res(pp, "DLSSNR.Output", out);
                     prof_mark(cmd, 1);
                     er = (hi ? g_snip_eval : g_nr_eval)(cmd, hh, pp, nullptr);
                     uav_barrier(cmd, out);
                     prof_mark(cmd, 2);
                     if (er != NVSDK_NGX_Result_Success) break;
+                    if (k + 1 < g_repeat) {
+                        barrier_transition(cmd, out,   kUAV, kCS);
+                        barrier_transition(cmd, stage, staged ? kSRV : kUAV, kCD);
+                        cmd->CopyResource(stage, out);
+                        barrier_transition(cmd, out,   kCS, kUAV);
+                        barrier_transition(cmd, stage, kCD, kSRV);
+                        cur_in = stage;
+                        staged = true;
+                    }
                 }
+                // After a staged pass the stage buffer sits in SRV (it was the
+                // last input); park it in UAV so the next frame can stage into it.
+                if (staged) barrier_transition(cmd, stage, kSRV, kUAV);
                 if (g_async_net && g_cx.snap_ready) {
                     // back to UAV so the next frame's snapshot can write them again
                     barrier_transition(cmd, g_cx.snap_color,
@@ -2118,6 +2148,9 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         g_nr_out = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
     if (!g_nr_out) { logf("[NRPRE] NR output allocation failed"); return; }
     pset_res(g_nr_params, "DLSSNR.Output", g_nr_out);
+    if (!g_nr_stage)
+        g_nr_stage = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (!g_nr_stage) logf("[NRPRE] NR staging buffer allocation failed; chained passes limited to one");
     g_setup_w = w; g_setup_h = h;
 
     auto core_eval = reinterpret_cast<PFN_Eval>(GetProcAddress(core, "NVSDK_NGX_D3D12_EvaluateFeature"));
@@ -2231,6 +2264,8 @@ static void build_hi(ID3D12GraphicsCommandList *cmd) {
             g_nr_out_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
             if (!g_nr_out_hi) return;
             pset_res(g_nr_params_hi, "DLSSNR.Output", g_nr_out_hi);
+            g_nr_stage_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (!g_nr_stage_hi) logf("[NRPRE] HI staging buffer allocation failed; chained passes limited to one");
             pset_u(g_nr_params_hi, "DLSSNR.InputWidth", g_out_w);
             pset_u(g_nr_params_hi, "DLSSNR.InputHeight", g_out_h);
             pset_u(g_nr_params_hi, "DLSSNR.OutputWidth", g_out_w);
@@ -2482,6 +2517,7 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Transfer", f)) g_transfer = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Saturation", f)) g_color_strength = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_effect_strength = f;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v)) g_repeat = (v < 1 ? 1 : (v > 4 ? 4 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoPaperWhite", v)) g_auto_pw = (v != 0);
     if (g_auto_pw && g_pw_valid) return;   // already converged, keep it
     logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f "
@@ -2532,6 +2568,7 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Transfer", g_transfer);
     reshade::set_config_value(rt, "NRPreUpscale", "Saturation", g_color_strength);
     reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength", g_effect_strength);
+    reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_repeat);
     reshade::set_config_value(rt, "NRPreUpscale", "Codec", g_codec_on ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "AutoMask", g_auto_mask ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "PaperWhite", g_paper_white);
@@ -2620,6 +2657,12 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     if (g_effect_strength == 0.0f && g_codec_on)
         ImGui::TextDisabled("Effect strength is zero: the NR effect is not visible.");
 
+    changed |= ImGui::SliderInt("Network passes", &g_repeat, 1, 4, "%d");
+    ImGui::SetItemTooltip("How many times the network is applied to the image in one frame. "
+                          "Each pass re-runs the network on the previous pass's result, so the "
+                          "effect compounds: 2 is roughly the network pushing itself twice as "
+                          "far. Each extra pass costs a full run of the network (~3.3 ms at "
+                          "1280x720), so at 4 the frame budget roughly quadruples. F9 cycles it.");
 
     ImGui::Spacing();
     ImGui::SeparatorText("Exposure");
@@ -2747,6 +2790,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     if (ImGui::Button("Reset to defaults")) {
         g_nr_enabled = true; g_skip_n = 1; g_codec_on = true;
         g_paper_white = 1.0f; g_knee = 0.75f;
+        g_repeat = 1;
         changed = true;
     }
     ImGui::SameLine();
@@ -3172,7 +3216,7 @@ static void service_pending_cleanup() {
     g_nr_handle = g_nr_handle_hi = nullptr;
 
     auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
-    rls(g_nr_out); rls(g_nr_out_hi);
+    rls(g_nr_out); rls(g_nr_stage); rls(g_nr_out_hi); rls(g_nr_stage_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     for (auto &page : g_descriptor_pages) rls(page.heap);
     g_descriptor_pages.clear();
@@ -3439,6 +3483,15 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         g_jit_burst = 40;
     }
     ph_prev = ph_down;
+
+    static bool rp_prev = false;
+    const bool rp_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (rp_down && !rp_prev) {
+        g_repeat = (g_repeat >= 4) ? 1 : g_repeat + 1;
+        logf("[NRPRE] F9: network passes -> %d", g_repeat);
+        g_jit_burst = 40;
+    }
+    rp_prev = rp_down;
 
     // Keep controls alive while old GPU work drains. Previously this return sat
     // above all hotkeys, so one never-submitted list made F7 appear dead forever.

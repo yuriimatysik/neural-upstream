@@ -84,6 +84,30 @@ Reference white for that normalisation is read from the game's own exposure
 buffer on a dedicated copy queue, so it tracks day and night without a fixed
 value tuned by hand.
 
+**Highlight and detail controls.** `Highlight curve` defaults to **Preserve
+highlights**: a gradual shoulder retains more differences between bright values
+in the FP16 network input, with gamut compression to keep saturated colours in
+range. **Legacy** selects the previous exponential shoulder and colour handling.
+This changes what the network sees; visual improvement still needs comparison
+in each game.
+
+`Detail strength` adjusts fine variations in the network's luminance gain;
+`Lighting strength` adjusts its locally averaged component. Both default to
+**1.00**, which uses the original gain transfer without neighbourhood filtering.
+Non-default values use an edge-weighted five-tap estimate; extra detail gain is
+limited to a quarter stop and the overall gain remains within 1/8 to 8. This is
+a local approximation of lighting versus detail, not a semantic separation.
+Both direct and reused-frame decode apply the same adjustment. Its GPU cost
+has not yet been measured.
+
+For comparison, keep cadence **Quality**, one network pass, and effect/transfer
+at **1.00**. First compare the two curves with detail and lighting at **1.00**;
+then try detail **1.15**, keeping lighting at **1.00**. Compare a stationary scene
+and camera motion, including bright textures, foliage and skin. Changing these
+controls resets NR history and cached output; allow it to settle before comparing.
+Settings persist as `EncodeCurve` (0 legacy, 1 preserve highlights),
+`DetailStrength` (0–2) and `LightingStrength` (0–1.5) in `[NRPreUpscale]`.
+
 **Cadence.** The network can run less often than every frame. The choice of which
 frame is anchored to the DLSS jitter rather than to a count of calls, because the
 number of evaluates per frame is not something an add-on can assume, and a
@@ -151,8 +175,8 @@ measured rather than guessed. On an RTX 4070 Ti at 1280x720 render resolution:
 | colour decode | 0.017 ms |
 
 The network is 99% of it, and about a third of a 100 fps frame. The colour
-pipeline is free by comparison, so there is nothing worth optimising on this
-side — cadence is the only lever that moves the number.
+pipeline is small by comparison at the original transfer settings. These timings
+predate the optional neighbourhood detail adjustment; measure its cost separately.
 
 ## Status
 

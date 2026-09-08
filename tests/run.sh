@@ -8,3 +8,4 @@ for test_source in tests/submission_tracker.cpp tests/descriptor_lifetime.cpp te
         "$test_source" -o "$test_binary"
     "$test_binary"
 done
+python3 tests/codec_math.py

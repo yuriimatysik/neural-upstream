@@ -7,6 +7,40 @@ dead ends cost more than the answers did.
 Hardware: RTX 4070 Ti (Ada, `sm_89`). Titles: GTA V Enhanced, Bright Memory:
 Infinite benchmark.
 
+## Avatar sky flicker: stable depth guides (September 2026)
+
+The user reports that the submission-tracking build works again in Black Flag
+and Avatar, but Avatar flickers when looking at bright sky/clouds, not grass.
+The supplied root `ReShade.log` identifies AFOP, Color/Depth at `2293x960`,
+cadence 1, synchronous NR, and heartbeat evaluation failure counters at zero.
+Resize cleanup also completes. The log does not record depth convention or
+pixel values, so it cannot establish the visual artifact's exact cause.
+
+There is a concrete depth-guide defect: histogram readback used one centre
+pixel's depth to set `DepthInverted`, repeatedly, without invalidating NR history.
+Distance at one pixel cannot identify a projection convention; changing the view
+between geometry and sky can change that decision. The earlier grid-alignment
+fix made this heuristic run at dimensions where it previously never sampled.
+
+The add-on now reads `DLSS.Feature.Create.Flags` for Super Resolution and Ray
+Reconstruction and preserves that contract per game feature across NR cleanup.
+It reads the signed parameter first (as the official helpers write it), with an
+unsigned fallback, and can learn flags from evaluate when creation was not seen.
+Missing flags use a fixed reversed-depth fallback, never a screen sample. A real
+convention change invalidates cached output/delta and requests an NR history
+reset. Heartbeats now include `depthinv` and `depthsrc`; the build marker is
+`stable depth guides v1`.
+
+The [NVIDIA depth flag definition](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h)
+and [creation helper](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_helpers.h)
+confirm the contract and signed parameter type. No HDR curve or highlight
+strength adjustment is included in this candidate, so its visual impact can be
+isolated. Validation: Linux host lifecycle regressions, a temporary harness using
+the production guide functions with a mocked NGX vtable (signed/unsigned/zero/
+invalid/missing flags, cached contracts, history invalidation), and Windows x64
+cross-builds. These checks do not validate the Windows ABI or GPU rendering.
+The sky correction still requires an in-game comparison and a fresh log.
+
 ---
 
 ## 1. The add-on
@@ -262,7 +296,13 @@ is switched off, which is teardown. Reading it as a failure cost hours.
 - **The descriptor ring was eight slots.** Three dispatches a frame with the CPU
   two or three frames ahead of the GPU left ~2.7 frames of headroom, so slots were
   being recycled while still in flight. It had been that way from the first day and
-  is the most likely cause of artefacts blamed on other things. Now 64.
+  is the most likely cause of artefacts blamed on other things. Now 64, and the
+  size is no longer what carries the safety: every submission stamps the covering
+  fence value onto the slots the lists it submitted actually wrote (tracked per
+  list, so one list finishing never clears a slot another still owns), and the CPU
+  that finds a slot in flight skips the pass instead of rewriting descriptors the
+  GPU is still reading. A bigger ring is mitigation; the per-slot fence is what
+  makes the race impossible.
 - **43% of evaluates were handed the raw colour.** The game issues more than one
   evaluate per frame and only the first claims it; the rest took the skipped-frame
   path and threw the enhancement away, even though `final_tex` already held that

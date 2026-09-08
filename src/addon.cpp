@@ -17,11 +17,15 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_params.h>
 #include "codec.hlsl.h"
+#include "submission_tracker.h"
+#include <atomic>
+#include <new>
 #include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
 #include <mutex>
+#include <unordered_map>
 
 extern "C" __declspec(dllexport) const char *NAME        = "DLSS5 NR Pre-Upscale";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -126,9 +130,10 @@ static unsigned g_setup_w = 0, g_setup_h = 0;
 static std::recursive_mutex g_state_mutex;
 static bool g_resize_pending = false;
 static bool install_submission_hook(ID3D12CommandQueue *queue);
+static bool prepare_recording(ID3D12GraphicsCommandList *cmd);
 static void track_recording(ID3D12GraphicsCommandList *cmd);
 static void service_pending_cleanup();
-static bool g_submission_hooked = false;
+static uint64_t recording_id(ID3D12CommandList *list);
 static int g_force_reset_frames = 0;
 // A Reset=1 from the game is only consumed on frames where NR actually runs.
 // At a cadence below 1:1 it can land on a skipped frame and be overwritten by
@@ -149,6 +154,29 @@ static bool g_diagnostics = true;
 // overlay and F7; re-reading the INI on every callback silently undid either
 // action a moment later.
 static bool g_enabled_setting_loaded = false;
+
+// ReShade 6.8 exposes its underlying COM object through this optional IID.
+// Older versions and native objects fall back to the original interface.
+// Private-data recording IDs below also work across wrappers without this IID.
+static const GUID kUnwrappedObject =
+    {0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81,0x2f,0x5e,0x9c,0xd3,0x7a,0x1b,0x42}};
+template <typename T> static T *native_ref(T *object) {
+    T *native = nullptr;
+    if (FAILED(object->QueryInterface(kUnwrappedObject, reinterpret_cast<void **>(&native)))) {
+        native = object;
+        native->AddRef();
+    }
+    return native;
+}
+static bool same_device(ID3D12Device *a, ID3D12Device *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    auto *na = native_ref(a);
+    auto *nb = native_ref(b);
+    const bool same = na == nb;
+    na->Release(); nb->Release();
+    return same;
+}
 
 #ifdef NR_STANDALONE
 static reshade::api::device        g_host_dev;
@@ -267,6 +295,7 @@ static void prof_report() {
 static unsigned g_phase = 0;
 static bool  g_delta_reuse = true;      // skipped frames reapply the last NR delta
 static bool  g_delta_valid = false;
+static bool  g_final_valid = false;   // final_tex holds a real frame
 // How transformative the result is belongs to the network, not to us: blending its
 // output or shifting exposure changes the picture globally, it does not make the
 // network less inventive. So the presets drive its own controls. Reference for the
@@ -314,8 +343,20 @@ static unsigned long long g_eval_tick = 0;
 // and changes on every new one, so nothing we count can drift out of step.
 // Roughly seven threads call the hook, so claim the frame with one atomic swap:
 // only the thread that wins the exchange is the frame's first evaluate.
+//
+// The swap assumes the jitter changes on every new frame. It does not when the
+// game holds it still (a paused scene, or a renderer that never animates the
+// TAA pattern), and then a plain prev != key says "repeat" for the rest of the
+// session: the network would run once and never again. A frozen key makes
+// frames indistinguishable, so the best a key can do then is claim one thread
+// per run of evaluates longer than any single frame's thread count: the run
+// counter restarts on every claim, so a frozen key yields one claimed frame
+// every ~kMaxClaimThreads/7 frames instead of none, and a live key (the common
+// case) still claims exactly one thread on the first transition.
 static volatile LONG64 g_jit_key = 0;
+static volatile LONG64 g_jit_run = 0;             // consecutive same-key repeats
 static volatile LONG64 g_frame_seq = 0;
+static const unsigned kMaxClaimThreads = 16;      // ~7 call today; headroom, not a limit
 static bool claim_frame(float jx, float jy, unsigned long long *out_frame) {
     unsigned kx, ky;
     std::memcpy(&kx, &jx, 4);
@@ -324,8 +365,18 @@ static bool claim_frame(float jx, float jy, unsigned long long *out_frame) {
     if (key == 0) key = 1;                       // 0 is the "nothing seen yet" marker
     // Unconditional atomic swap: whichever thread gets back a different key is
     // the first evaluate of this frame, and exactly one thread can.
-    LONG64 prev = InterlockedExchange64(&g_jit_key, key);
-    const bool first = (prev != key);
+    const LONG64 prev = InterlockedExchange64(&g_jit_key, key);
+    bool first = (prev != key);
+    if (first) {
+        InterlockedExchange64(&g_jit_run, 0);
+    } else {
+        const LONG64 run = InterlockedIncrement64(&g_jit_run);
+        // A run longer than any frame's thread count cannot be one frame.
+        if (run > (LONG64)kMaxClaimThreads) {
+            first = true;
+            InterlockedExchange64(&g_jit_run, 0); // restart: one claim per long run
+        }
+    }
     LONG64 seq = first ? InterlockedIncrement64(&g_frame_seq)
                        : InterlockedCompareExchange64(&g_frame_seq, 0, 0);
     *out_frame = (unsigned long long)seq;
@@ -334,7 +385,6 @@ static bool claim_frame(float jx, float jy, unsigned long long *out_frame) {
 static void release_state(const char *why);
 static void record_exposure_sample(ID3D12GraphicsCommandList *, ID3D12Device *,
                                    ID3D12Resource *, ID3D12Resource *, unsigned, unsigned);
-static void record_exposure_texture(ID3D12GraphicsCommandList *, ID3D12Resource *);
 static ID3D12Device *g_device = nullptr;
 static ID3D12Resource *make_uav_tex(ID3D12Device *, unsigned, unsigned, DXGI_FORMAT);
 static void codec_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12PipelineState *,
@@ -380,12 +430,57 @@ static bool  g_pw_valid = false;
 static unsigned g_pw_updates = 0;
 static float g_pw_measured = 0.0f;
 // Derived alongside paper white from the same histogram -- no extra passes.
-static bool  g_auto_guides = true;     // derive depth convention + HDR + shoulder
+static bool  g_auto_guides = true;     // derive HDR + shoulder
 static bool  g_hdr_detected = true;    // latched: proven HDR, never unlatched
 static unsigned g_hdr_samples = 0;
-static bool  g_depth_reversed = true;  // near geometry sits at the high end
+static bool  g_depth_reversed = true;  // fixed fallback when NGX flags are unavailable
+static bool  g_depth_from_game = false;
+// Creation flags may be absent from the evaluate parameter block. Keep the
+// game's contract across NR-only cleanup; swapchain resize need not recreate DLSS.
+static std::unordered_map<unsigned, unsigned> g_dlss_create_flags;
 static bool  g_guides_valid = false;
 static float g_knee_measured = 0.75f;
+
+static bool read_dlss_flags(const NVSDK_NGX_Parameter *params, unsigned &flags) {
+    if (!params) return false;
+    auto **vt = *reinterpret_cast<void ***>(const_cast<NVSDK_NGX_Parameter *>(params));
+    using GetI = NVSDK_NGX_Result (STDMETHODCALLTYPE *)(const NVSDK_NGX_Parameter *, const char *, int *);
+    using GetU = NVSDK_NGX_Result (STDMETHODCALLTYPE *)(const NVSDK_NGX_Parameter *, const char *, unsigned *);
+    int signed_flags = 0;
+    // Official DLSS/DLSSD helpers use SetI; retain the unsigned proxy fallback.
+    if (reinterpret_cast<GetI>(vt[11])(params, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+                                     &signed_flags) == NVSDK_NGX_Result_Success) {
+        flags = static_cast<unsigned>(signed_flags);
+    } else if (reinterpret_cast<GetU>(vt[12])(params, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+                                            &flags) != NVSDK_NGX_Result_Success) {
+        return false;
+    }
+    return (flags & static_cast<unsigned>(NVSDK_NGX_DLSS_Feature_Flags_IsInvalid)) == 0;
+}
+
+static void update_depth_guide(const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params) {
+    unsigned flags = 0;
+    bool known = false;
+    const auto saved = g_dlss_create_flags.find(feat_id(feat));
+    if (saved != g_dlss_create_flags.end()) {
+        flags = saved->second;
+        known = true;
+    } else {
+        known = read_dlss_flags(params, flags);
+        if (known) g_dlss_create_flags[feat_id(feat)] = flags;
+    }
+    const bool reversed = !known || (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+    if (reversed != g_depth_reversed) {
+        g_reset_pending = true;
+        g_delta_valid = false;
+        g_final_valid = false;
+    }
+    if (reversed != g_depth_reversed || known != g_depth_from_game)
+        logf("[NRPRE] depth guide: %s source=%s flags=0x%08X",
+             reversed ? "reversed" : "normal", known ? "game" : "fixed fallback", flags);
+    g_depth_reversed = reversed;
+    g_depth_from_game = known;
+}
 
 // Network-side controls. We were leaving all of these unset, which meant the
 // final post block fell through to its simple_blend kernel instead of the
@@ -591,6 +686,15 @@ static void exp_queue_tick(ID3D12Device *dev, ID3D12CommandQueue *gfx) {
 // ---- colour-codec plumbing ------------------------------------------------
 // Two compute passes wrap the NR evaluate: encode the game's scene-linear HDR
 // into the bounded sRGB domain DLSSNR was trained on, then decode back.
+// The ring has to outlast the frames the CPU runs ahead of the GPU: a slot reused
+// while its dispatch is still in flight hands the shader another frame's views.
+// Eight was already only ~2.7 frames of headroom at three dispatches a frame, and
+// the snapshot path takes it to six a frame -- 1.3 frames, which corrupts reliably.
+// The heap is kCxSlots * kCxDescriptorsPerSlot descriptors and nothing else,
+// so this is cheap. Keep the layout in one place: t0..t4, u0, u1.
+static const unsigned kCxSlots = 64;
+static const unsigned kCxDescriptorsPerSlot = 7;
+
 struct Codec {
     ID3D12RootSignature *root = nullptr;
     ID3D12PipelineState *pso_enc = nullptr, *pso_dec = nullptr;
@@ -618,17 +722,72 @@ struct Codec {
     ID3D12DescriptorHeap *clear_heap = nullptr;   // non-shader-visible, for the UAV clear
     UINT inc = 0;
     unsigned slot = 0;              // ring so in-flight frames keep their descriptors
+    // The ring's headroom is a size argument, not a proof: on a long hitch the
+    // GPU can fall further behind than 64 dispatches. sub_fence is signalled by
+    // the submission hook once each tracked list has executed; slot_epoch[S]
+    // holds the value that covers slot S's last dispatch, and a write to S that
+    // finds it uncompleted skips one frame instead of corrupting in-flight work.
+    ID3D12Fence *sub_fence = nullptr;
+    UINT64 sub_val = 0;
+    UINT64 slot_epoch[kCxSlots] = {};
     bool ready = false;
 } g_cx;
 
-// The ring has to outlast the frames the CPU runs ahead of the GPU: a slot reused
-// while its dispatch is still in flight hands the shader another frame's views.
-// Eight was already only ~2.7 frames of headroom at three dispatches a frame, and
-// the snapshot path takes it to six a frame -- 1.3 frames, which corrupts reliably.
-// The heap is kCxSlots * kCxDescriptorsPerSlot descriptors and nothing else,
-// so this is cheap. Keep the layout in one place: t0..t4, u0, u1.
-static const unsigned kCxSlots = 64;
-static const unsigned kCxDescriptorsPerSlot = 7;
+// Which ring slots each tracked list wrote since its last submission. The
+// submission hook stamps the covering fence value onto exactly those slots, so
+// one list finishing never clears a slot another list still owns.
+struct ListSlots { std::uint64_t id; std::uint64_t mask; };
+static ListSlots g_list_slots[16];
+static unsigned g_list_slots_n = 0;
+static void list_slot_mark(std::uint64_t id, unsigned slot) {
+    for (unsigned i = 0; i < g_list_slots_n; ++i)
+        if (g_list_slots[i].id == id) { g_list_slots[i].mask |= (1ull << slot); return; }
+    if (g_list_slots_n < 16) {
+        g_list_slots[g_list_slots_n].id = id;
+        g_list_slots[g_list_slots_n].mask = (1ull << slot);
+        ++g_list_slots_n;
+    }
+}
+// Consumed on submission: the stamped fence value covers the execution just
+// recorded, and a later re-execution of a closed list only matters after a
+// ring wrap -- at which point the slot is reused only once this fence has
+// completed, i.e. after the earlier execution already read the descriptors.
+static std::uint64_t list_slot_take(std::uint64_t id) {
+    for (unsigned i = 0; i < g_list_slots_n; ++i)
+        if (g_list_slots[i].id == id) {
+            const std::uint64_t m = g_list_slots[i].mask;
+            g_list_slots[i].mask = 0;
+            return m;
+        }
+    return 0;
+}
+static void list_slot_drop(std::uint64_t id) {
+    for (unsigned i = 0; i < g_list_slots_n; ++i)
+        if (g_list_slots[i].id == id) {
+            g_list_slots[i] = g_list_slots[g_list_slots_n - 1];
+            --g_list_slots_n;
+            return;
+        }
+}
+
+// Reserve the next ring slot. If it is still in flight -- the fence stamped on
+// the list that recorded its last dispatch has not completed -- rewriting its
+// descriptors would race the GPU, so the ring is rewound and the caller must
+// skip the pass it was about to record. The frame then falls back to the
+// previous frame's stored content, the same path a cadence skip already uses.
+static bool cx_slot_acquire(ID3D12GraphicsCommandList *cmd, unsigned &slot) {
+    slot = g_cx.slot;
+    g_cx.slot = (g_cx.slot + 1) % kCxSlots;
+    if (g_cx.sub_fence == nullptr) return true;
+    if (g_cx.slot_epoch[slot] != 0 &&
+        g_cx.sub_fence->GetCompletedValue() < g_cx.slot_epoch[slot]) {
+        g_cx.slot = slot;
+        return false;
+    }
+    g_cx.slot_epoch[slot] = 0;
+    if (const uint64_t id = recording_id(cmd)) list_slot_mark(id, slot);
+    return true;
+}
 
 // These two return a struct by value: MSVC uses the hidden-sret convention that
 // MinGW does not match, so call them through the vtable explicitly.
@@ -808,6 +967,7 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_cx.exp_rb));
 
         dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cx.fence));
+        dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cx.sub_fence));
 
         // ClearUnorderedAccessViewUint needs a CPU handle from a heap that is
         // NOT shader visible, in addition to the shader-visible GPU handle.
@@ -908,7 +1068,6 @@ static void barrier_transition(ID3D12GraphicsCommandList *cmd, ID3D12Resource *r
     reinterpret_cast<pfn_t>(vt[26])(cmd, 1, &b);
 }
 static unsigned          g_eval_count = 0;
-static bool              g_final_valid = false;   // final_tex holds a real frame
 static unsigned          g_out_w = 2560, g_out_h = 1440;
 static PFN_Eval          g_snip_eval = nullptr;
 static PFN_Eval          g_nr_eval = nullptr;
@@ -1128,7 +1287,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
 
     // Resize detection must precede setup, snapshots, codec allocation and any
     // cached output selection. A pending reset always passes the game through.
-    if (!g_submission_hooked || g_resize_pending)
+    if (g_resize_pending)
         return t_orig_eval(cmd, feat, params, cb);
     unsigned color_w = 0, color_h = 0;
     if (params && cmd) {
@@ -1144,7 +1303,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         }
         ID3D12Device *command_device = nullptr;
         if (SUCCEEDED(cmd->GetDevice(IID_PPV_ARGS(&command_device)))) {
-            const bool changed = g_setup_w && g_device && command_device != g_device;
+            const bool changed = g_setup_w && g_device && !same_device(command_device, g_device);
             command_device->Release();
             if (changed) {
                 release_state("command list device changed");
@@ -1157,6 +1316,12 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             return t_orig_eval(cmd, feat, params, cb);
         }
     }
+    // Discover the implementation used by NGX, which can bypass the presentation
+    // queue's wrapper entirely. Do this before feature creation can record work.
+    if (!cmd || !params || !color_w || !color_h || !prepare_recording(cmd))
+        return t_orig_eval(cmd, feat, params, cb);
+
+    update_depth_guide(feat, params);
 
     {   // heartbeat: proves whether the hook survives a device/swapchain recreation
         static unsigned long long hb = 0;
@@ -1164,14 +1329,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             if (g_diagnostics)
             logf("[NRPRE] HB #%llu handle=%p | pw=%.4f meas=%.4f valid=%d upd=%u "
                  "| hdr=%u det=%d knee=%.3f kmeas=%.3f | expfresh=%u fromgame=%d "
-                 "| net=%ux%u finalvalid=%d | cad=%d async=%d | erfail=%u grfail=%u passthru=%u",
+                 "| net=%ux%u finalvalid=%d | cad=%d async=%d | erfail=%u grfail=%u passthru=%u "
+                 "| depthinv=%d depthsrc=%s",
                  (unsigned long long)hb, (void *)g_nr_handle,
                  g_paper_white, g_pw_measured, (int)g_pw_valid, g_pw_updates,
                  g_hdr_mode, (int)g_hdr_detected, g_knee, g_knee_measured,
                  g_exp_fresh, (int)g_exp_from_game,
                  g_net_w, g_net_h, (int)g_final_valid,
                  g_skip_n, (int)g_async_net,   // which mode was actually running, always
-                 g_er_fail, g_gr_fail, g_pass_frames);
+                 g_er_fail, g_gr_fail, g_pass_frames,
+                 (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback");
     }
     if (params != nullptr && (g_logged < 12 || !g_setup_done)) {
         if (g_logged == 0) probe_slots(params, NVSDK_NGX_Parameter_Color);
@@ -1313,8 +1480,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     logf("[NRPRE] RST gameI=%d(0x%08X) gameU=%u(0x%08X) force=%d pending=%d",
                          rst_i, (unsigned)ri, rst_u, (unsigned)ru,
                          g_force_reset_frames, (int)g_reset_pending);
-                if (g_auto_guides)
-                    pset_u(pp, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
+                pset_u(pp, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
                 pset_u(pp, "DLSSNR.UseAutoMask", g_auto_mask ? 1u : 0u);
                 pset_u(pp, "DLSSNR.Style", (unsigned)g_style);
                 pset_f(pp, "DLSSNR.Intensity", g_intensity);
@@ -1474,6 +1640,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 prof_mark(cmd, 3);
                 prof_resolve(cmd);
             } else if (use_codec && g_delta_reuse && g_delta_valid) {
+                ensure_recording();
                 // Skipped frame: develop the *current* colour and re-apply the stored
                 // effect to it. No network, so the saving stands, but the image being
                 // handed on is built from this frame rather than the previous one.
@@ -1517,6 +1684,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 ++g_pass_frames;   // the effect is fully off on this frame: count it
             }
             if (g_rebind && !hi && feed != nullptr) {
+                ensure_recording();
                 barrier_transition(cmd, feed, kUAV, kSRV);
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
                          NVSDK_NGX_Parameter_Color, feed);
@@ -1636,7 +1804,18 @@ static PFN_Create g_orig_create = nullptr;
 static NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList *cmd, NVSDK_NGX_Feature id,
         NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle **out)
 {
+    const bool dlss = id == NVSDK_NGX_Feature_SuperSampling || id == NVSDK_NGX_Feature_RayReconstruction;
+    unsigned flags = 0;
+    const bool flags_valid = dlss && read_dlss_flags(params, flags);
     NVSDK_NGX_Result r = g_orig_create(cmd, id, params, out);
+    if (dlss && r == NVSDK_NGX_Result_Success && out && *out) {
+        std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+        const unsigned handle = feat_id(*out);
+        if (flags_valid) g_dlss_create_flags[handle] = flags;
+        else g_dlss_create_flags.erase(handle); // a recycled handle must not inherit flags
+        logf("[NRPRE] DLSS depth contract: handle=%u flags=0x%08X valid=%d",
+             handle, flags, (int)flags_valid);
+    }
     char color[128], output[128], depth[128], mvec[128];
     describe(params, "DLSSNR.Color",  color,  sizeof color);
     describe(params, "DLSSNR.Output", output, sizeof output);
@@ -1848,6 +2027,7 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         g_setup_done = true;
         return;
     }
+    track_recording(cmd); // CreateFeature may record GPU initialization too.
     r = core_create(cmd, kFeatureDLSSNR, g_nr_params, &g_nr_handle);
     if (g_nr_handle) {
         g_nr_eval = core_eval;
@@ -1944,7 +2124,7 @@ static void build_hi(ID3D12GraphicsCommandList *cmd) {
             pset_u(g_nr_params_hi, "DLSSNR.Height", g_out_h);
             pset_u(g_nr_params_hi, "DLSSNR.Enabled", 1);
             pset_u(g_nr_params_hi, "DLSSNR.Hint.Render.Preset", 0);
-            pset_u(g_nr_params_hi, "DLSSNR.DepthInverted", 1);
+            pset_u(g_nr_params_hi, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
             pset_f(g_nr_params_hi, "DLSSNR.ScalingRatio", 1.0f);
             pset_u(g_nr_params_hi, "CreationNodeMask", 1);
             pset_u(g_nr_params_hi, "VisibilityNodeMask", 1);
@@ -1961,6 +2141,7 @@ static void build_hi(ID3D12GraphicsCommandList *cmd) {
                 pset_u(g_nr_params_hi, widths[i], g_out_w);
                 pset_u(g_nr_params_hi, heights[i], g_out_h);
             }
+            track_recording(cmd);
             NVSDK_NGX_Result rh = sc2(cmd, kFeatureDLSSNR, g_nr_params_hi, &g_nr_handle_hi);
             g_hi_release = sr2;
             logf("[NRPRE] 2c: HI feature (%ux%u) -> 0x%08X handle=%p out=%p",
@@ -1976,8 +2157,8 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
                            ID3D12Resource *u0, unsigned w, unsigned h,
                            ID3D12Resource *t3, ID3D12Resource *t4)
 {
-    const unsigned slot = g_cx.slot;
-    g_cx.slot = (g_cx.slot + 1) % kCxSlots;
+    unsigned slot = 0;
+    if (!cx_slot_acquire(cmd, slot)) return;   // in flight: keep the last pass
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
@@ -2081,8 +2262,8 @@ static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
 {
     if (cmd == nullptr || dev == nullptr || srcTex == nullptr || dstTex == nullptr) return;
     if (g_cx.pso_snap == nullptr || g_cx.heap == nullptr) return;
-    const unsigned slot = g_cx.slot;
-    g_cx.slot = (g_cx.slot + 1) % kCxSlots;
+    unsigned slot = 0;
+    if (!cx_slot_acquire(cmd, slot)) return;   // in flight: keep the last snapshot
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
     cpu.ptr += (SIZE_T)slot * kCxDescriptorsPerSlot * g_cx.inc;
@@ -2350,9 +2531,10 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                                                              : "scene histogram (game has none)");
             ImGui::TextDisabled("paper white %.3f   shoulder %.2f   (%u samples)",
                                 g_pw_measured, g_knee_measured, g_pw_updates);
-            ImGui::TextDisabled("buffer: %s      depth: %s",
+            ImGui::TextDisabled("buffer: %s      depth: %s (%s)",
                                 g_hdr_detected ? "HDR (developing)" : "SDR (passthrough)",
-                                g_depth_reversed ? "reversed" : "normal");
+                                g_depth_reversed ? "reversed" : "normal",
+                                g_depth_from_game ? "game" : "fixed fallback");
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "sampling...");
         }
@@ -2452,7 +2634,9 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     } else {
         ImGui::TextDisabled("Waiting for frames...");
     }
-    if (g_nr_handle == nullptr)
+    if (g_resize_pending)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "NR paused while previous GPU work finishes");
+    else if (g_nr_handle == nullptr)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Network not created yet");
 
     ImGui::Spacing();
@@ -2472,35 +2656,6 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
 // second and read the result back a few frames later -- never stalling the GPU.
 // Recording happens here; the fence is signalled at present, once the game has
 // actually submitted the command list this was recorded into.
-// The game hands DLSS a 1x1 texture holding the exposure it already computed for
-// its own tonemapper (NVSDK_NGX_Parameter_ExposureTexture). That is the exact
-// number a histogram can only approximate, so copy it out instead of guessing.
-static void record_exposure_texture(ID3D12GraphicsCommandList *cmd, ID3D12Resource *tex) {
-    if (tex == nullptr || g_cx.exp_rb == nullptr || g_cx.copy_recorded) return;
-    static unsigned n = 0;
-    if ((n++ % 15) != 0) return;
-
-    D3D12_TEXTURE_COPY_LOCATION dst{}, srcl{};
-    dst.pResource = g_cx.exp_rb;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Offset = 0;
-    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
-    dst.PlacedFootprint.Footprint.Width = 1;
-    dst.PlacedFootprint.Footprint.Height = 1;
-    dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = 256;
-    srcl.pResource = tex;
-    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    srcl.SubresourceIndex = 0;
-
-    // NO barriers on a resource the game owns: we cannot know the state it is
-    // actually in, and declaring the wrong StateBefore hangs or removes the
-    // device. Measured: enabling this path froze the game on activation.
-    cmd->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
-    g_cx.copy_recorded = true;
-    g_cx.exp_is_texture = true;
-}
-
 static void record_exposure_sample(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
                                    ID3D12Resource *src, ID3D12Resource *depth,
                                    unsigned w, unsigned h)
@@ -2511,12 +2666,17 @@ static void record_exposure_sample(ID3D12GraphicsCommandList *cmd, ID3D12Device 
     const unsigned period = g_exp_from_game ? 60u : 20u;   // guides only, when the game covers exposure
     if ((n++ % period) != 0 || g_cx.pending || g_cx.copy_recorded) return;
 
-    const unsigned slot = g_cx.slot;                 // codec_dispatch will use this slot
+    // The Clear below binds this slot's u1, so the slot must be reserved before
+    // any view is written: writing into one the GPU still reads corrupts it.
+    // If it is in flight the sample is dropped for this frame; the histogram
+    // just keeps its last values.
+    unsigned slot = 0;
+    if (!cx_slot_acquire(cmd, slot)) return;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
     // The root table is t0..t4, u0, u1. The old slot*5+4 address pointed at
     // another slot's SRV (and even slot 0 was t4), so the clear could remove
-    // the D3D12 device after the histogram had run for a while. This slot has
-    // not gone through codec_dispatch yet, so create u1 before using it.
+    // the D3D12 device after the histogram had run for a while. The slot was
+    // just reserved, so its u1 has never been written: create it before use.
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     cpu.ptr += ((SIZE_T)slot * kCxDescriptorsPerSlot + 6u) * g_cx.inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC hv{};
@@ -2585,8 +2745,10 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
     D3D12_RANGE rd{ 0, kHistBins * sizeof(UINT) };
     if (FAILED(g_cx.hist_rb->Map(0, &rd, &mapped)) || mapped == nullptr) return;
     const UINT *bins = static_cast<const UINT *>(mapped);
+    // Luminance only: bins 128..131 carry HDR and depth-convention samples,
+    // not scene brightness, and would skew the percentile target.
     UINT64 total = 0;
-    for (unsigned i = 0; i < kHistBins; ++i) total += bins[i];
+    for (unsigned i = 0; i < 128; ++i) total += bins[i];
     if (total > 1000) {
         const UINT64 target = (UINT64)(total * 0.99);      // 99th percentile
         UINT64 acc = 0; unsigned bin = 127;
@@ -2605,10 +2767,9 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
             if (over * 1000ull > total) g_hdr_detected = true;
             ++g_hdr_samples;
             if (!g_hdr_detected && g_hdr_samples < 400) g_hdr_detected = true;
-            if (bins[130] > 0) {
-                const float d = (float)bins[129] / (1000.0f * (float)bins[130]);
-                g_depth_reversed = (d > 0.5f);
-            }
+            // Depth convention comes from the game's NGX flags. A screen sample
+            // measures distance, not convention: sky and nearby geometry must
+            // never flip DepthInverted while the network retains its history.
             // Shoulder: put the knee just under the 99th percentile, so the roll
             // off starts where the scene's own highlights begin.
             UINT64 acc99 = 0; unsigned b99 = 127;
@@ -2659,38 +2820,104 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
 // A resize is a request, never proof of GPU completion. Track actual submission
 // of every list on which we record, then fence every queue which executes it.
 // This also works in standalone mode, whose "present" tick is an evaluate hook.
-struct RecordedList { ID3D12CommandList *list; bool submitted; };
 struct SubmissionFence {
     ID3D12CommandQueue *queue;
     ID3D12Fence *fence;
     UINT64 value;
 };
-static std::vector<RecordedList> g_recorded_lists;
+static nr::SubmissionTracker g_recorded_lists;
 static std::vector<SubmissionFence> g_submission_fences;
 static bool g_submission_failed = false;
 using PFN_ExecuteLists = void (STDMETHODCALLTYPE *)(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *);
-static PFN_ExecuteLists g_orig_execute_lists = nullptr;
+using PFN_ResetList = HRESULT (STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandAllocator *, ID3D12PipelineState *);
+static constexpr unsigned kMaxSubmissionHooks = 8;
+static PFN_ExecuteLists g_orig_execute_lists[kMaxSubmissionHooks] = {};
+static PFN_ResetList g_orig_reset_lists[kMaxSubmissionHooks] = {};
+static void *g_execute_targets[kMaxSubmissionHooks] = {};
+static void *g_reset_targets[kMaxSubmissionHooks] = {};
+static std::vector<void *> g_submission_device_targets;
 
-static void track_recording(ID3D12GraphicsCommandList *cmd) {
-    for (auto &entry : g_recorded_lists) {
-        if (entry.list == cmd) { entry.submitted = false; return; }
+static const GUID kRecordingToken =
+    {0xdc8d11a3,0x52a1,0x49bb,{0xb2,0x2d,0x18,0x89,0xda,0x97,0x36,0x04}};
+
+// Private data is forwarded by command-list wrappers. The list owns this token;
+// the tracker keeps only its ID, so it cannot prevent abandoned list destruction.
+class RecordingToken final : public IUnknown {
+    std::atomic<ULONG> refs{1};
+public:
+    const uint64_t id;
+    explicit RecordingToken(uint64_t value) : id(value) {}
+    ~RecordingToken() {
+        std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+        g_recorded_lists.discard(id);
+        list_slot_drop(id);   // unsubmitted slot writes stop covering the ring
     }
-    g_recorded_lists.push_back({cmd, false});
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!IsEqualIID(iid, __uuidof(IUnknown))) return E_NOINTERFACE;
+        *out = static_cast<IUnknown *>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG remaining = --refs;
+        if (!remaining) delete this;
+        return remaining;
+    }
+};
+
+static uint64_t recording_id(ID3D12CommandList *list) {
+    RecordingToken *token = nullptr;
+    UINT size = sizeof(token);
+    if (FAILED(list->GetPrivateData(kRecordingToken, &size, &token)) || !token) return 0;
+    const uint64_t id = token->id;
+    token->Release(); // GetPrivateData AddRefs stored COM interfaces.
+    return id;
 }
 
+static void track_recording(ID3D12GraphicsCommandList *cmd) {
+    if (const uint64_t id = recording_id(cmd)) {
+        g_recorded_lists.record(id);
+    } else {
+        // prepare_recording must have succeeded before any GPU commands.
+        g_submission_failed = true;
+        logf("[NRPRE] recording identity lost; retaining resources");
+    }
+}
+
+template <unsigned Index>
 static void STDMETHODCALLTYPE hk_execute_lists(ID3D12CommandQueue *queue, UINT count,
                                                ID3D12CommandList *const *lists) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     // A closed list can be submitted more than once. Serialize the submission
     // itself with cleanup, not only its following fence bookkeeping.
-    g_orig_execute_lists(queue, count, lists);
+    g_orig_execute_lists[Index](queue, count, lists);
     bool referenced = false;
     for (UINT i = 0; i < count; ++i) {
-        for (auto &entry : g_recorded_lists) {
-            if (entry.list == lists[i]) { entry.submitted = true; referenced = true; }
-        }
+        if (g_recorded_lists.submit(recording_id(lists[i]))) referenced = true;
     }
     if (!referenced) return;
+    // Descriptor ring: this submission completes the dispatches these lists
+    // recorded, so stamp the covering value onto exactly the slots they wrote.
+    if (g_cx.sub_fence != nullptr) {
+        const UINT64 v = ++g_cx.sub_val;
+        bool any = false;
+        for (UINT i = 0; i < count; ++i) {
+            const std::uint64_t mask = list_slot_take(recording_id(lists[i]));
+            for (unsigned s = 0; s < kCxSlots; ++s)
+                if ((mask >> s) & 1ull) g_cx.slot_epoch[s] = v;
+            any |= (mask != 0);
+        }
+        if (any) {
+            if (FAILED(queue->Signal(g_cx.sub_fence, v))) {
+                // Without the signal the epochs would block their slots forever.
+                for (unsigned s = 0; s < kCxSlots; ++s)
+                    if (g_cx.slot_epoch[s] == v) g_cx.slot_epoch[s] = 0;
+                g_submission_failed = true;
+                logf("[NRPRE] descriptor-ring fence signal failed");
+            }
+        }
+    }
     SubmissionFence *use = nullptr;
     for (auto &entry : g_submission_fences) if (entry.queue == queue) use = &entry;
     if (!use) {
@@ -2709,6 +2936,7 @@ static void STDMETHODCALLTYPE hk_execute_lists(ID3D12CommandQueue *queue, UINT c
         queue->AddRef();
         g_submission_fences.push_back({queue, fence, 0});
         use = &g_submission_fences.back();
+        logf("[NRPRE] tracking submitted NR work on queue=%p", (void *)queue);
     }
     if (FAILED(queue->Signal(use->fence, ++use->value))) {
         g_submission_failed = true;
@@ -2716,22 +2944,117 @@ static void STDMETHODCALLTYPE hk_execute_lists(ID3D12CommandQueue *queue, UINT c
     }
 }
 
-static bool install_submission_hook(ID3D12CommandQueue *queue) {
-    if (g_submission_hooked) return true;
-    if (!queue) return false;
-    MH_STATUS status = MH_Initialize();
-    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return false;
-    auto **vt = *reinterpret_cast<void ***>(queue);
-    // ID3D12CommandQueue::ExecuteCommandLists is slot 10.
-    if (MH_CreateHook(vt[10], reinterpret_cast<void *>(&hk_execute_lists),
-                      reinterpret_cast<void **>(&g_orig_execute_lists)) != MH_OK) return false;
-    if (MH_EnableHook(vt[10]) != MH_OK) {
-        MH_RemoveHook(vt[10]);
-        g_orig_execute_lists = nullptr;
+template <unsigned Index>
+static HRESULT STDMETHODCALLTYPE hk_reset_list(ID3D12GraphicsCommandList *list,
+        ID3D12CommandAllocator *allocator, ID3D12PipelineState *state) {
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    const HRESULT result = g_orig_reset_lists[Index](list, allocator, state);
+    // ReShade's reset event precedes Reset and cannot establish success.
+    // Discarding a recording never discards fences from its earlier executions.
+    if (SUCCEEDED(result)) {
+        const std::uint64_t id = recording_id(list);
+        g_recorded_lists.discard(id);
+        list_slot_drop(id);
+    }
+    return result;
+}
+
+static const PFN_ExecuteLists kExecuteHooks[] = {
+    hk_execute_lists<0>, hk_execute_lists<1>, hk_execute_lists<2>, hk_execute_lists<3>,
+    hk_execute_lists<4>, hk_execute_lists<5>, hk_execute_lists<6>, hk_execute_lists<7>
+};
+static const PFN_ResetList kResetHooks[] = {
+    hk_reset_list<0>, hk_reset_list<1>, hk_reset_list<2>, hk_reset_list<3>,
+    hk_reset_list<4>, hk_reset_list<5>, hk_reset_list<6>, hk_reset_list<7>
+};
+
+template <typename Fn>
+static bool install_lifetime_hook(void *target, void **targets, Fn *originals,
+                                   const Fn *hooks, const char *name) {
+    unsigned slot = 0;
+    while (slot < kMaxSubmissionHooks && targets[slot]) {
+        if (targets[slot] == target) return true;
+        ++slot;
+    }
+    if (slot == kMaxSubmissionHooks) return false;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return false;
+    const MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void *>(hooks[slot]),
+                                          reinterpret_cast<void **>(&originals[slot]));
+    if (status != MH_OK) {
+        logf("[NRPRE] %s hook failed: %d", name, (int)status);
         return false;
     }
-    g_submission_hooked = true;
+    if (MH_EnableHook(target) != MH_OK) {
+        MH_RemoveHook(target);
+        originals[slot] = nullptr;
+        return false;
+    }
+    targets[slot] = target;
+    logf("[NRPRE] %s hook %u installed at %p", name, slot, target);
     return true;
+}
+
+static bool install_submission_hook(ID3D12CommandQueue *queue) {
+    if (!queue) return false;
+    auto *native = native_ref(queue);
+    auto **vt = *reinterpret_cast<void ***>(native);
+    // ID3D12CommandQueue::ExecuteCommandLists is slot 10.
+    const bool ok = install_lifetime_hook(vt[10], g_execute_targets, g_orig_execute_lists,
+                                          kExecuteHooks, "ExecuteCommandLists");
+    native->Release();
+    return ok;
+}
+
+static bool prepare_recording(ID3D12GraphicsCommandList *cmd) {
+    if (recording_id(cmd)) return true;
+    auto *native = native_ref(cmd);
+    auto **vt = *reinterpret_cast<void ***>(native);
+    // ID3D12GraphicsCommandList::Reset is slot 10.
+    bool ok = install_lifetime_hook(vt[10], g_reset_targets, g_orig_reset_lists,
+                                    kResetHooks, "command list Reset");
+    ID3D12Device *device = nullptr;
+    if (ok) ok = SUCCEEDED(native->GetDevice(IID_PPV_ARGS(&device)));
+    if (device) {
+        auto *native_device = native_ref(device);
+        device->Release();
+        void *create_target = (*reinterpret_cast<void ***>(native_device))[8];
+        if (std::find(g_submission_device_targets.begin(), g_submission_device_targets.end(),
+                      create_target) == g_submission_device_targets.end()) {
+            // Discover both queue implementations on the device used by NGX.
+            // Merely hooking the first presentation queue misses native/compute
+            // submissions in games with intermediate queue wrappers.
+            for (auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE}) {
+                D3D12_COMMAND_QUEUE_DESC desc{};
+                desc.Type = type;
+                ID3D12CommandQueue *probe = nullptr;
+                if (FAILED(native_device->CreateCommandQueue(&desc, IID_PPV_ARGS(&probe)))) {
+                    ok = false;
+                    break;
+                }
+                const bool hooked = install_submission_hook(probe);
+                probe->Release();
+                if (!hooked) { ok = false; break; }
+            }
+            if (ok) g_submission_device_targets.push_back(create_target);
+        }
+        native_device->Release();
+    }
+    if (ok) {
+        static uint64_t next_id = 0;
+        auto *token = new (std::nothrow) RecordingToken(++next_id);
+        ok = token && SUCCEEDED(native->SetPrivateDataInterface(kRecordingToken, token));
+        if (token) token->Release();
+        // Verify the NGX-facing wrapper shares the native object's private data.
+        ok = ok && recording_id(cmd) != 0;
+    }
+    native->Release();
+    if (!ok) {
+        static bool reported = false;
+        if (!reported) logf("[NRPRE] submission tracking unavailable; skipping NR before recording");
+        reported = true;
+    }
+    return ok;
 }
 
 static void release_state(const char *why) {
@@ -2742,7 +3065,7 @@ static void release_state(const char *why) {
 
 static void service_pending_cleanup() {
     if (!g_resize_pending || g_submission_failed) return;
-    for (const auto &entry : g_recorded_lists) if (!entry.submitted) return;
+    if (!g_recorded_lists.ready()) return;
     for (const auto &entry : g_submission_fences) {
         const UINT64 completed = entry.fence->GetCompletedValue();
         if (completed == UINT64_MAX || completed < entry.value) return;
@@ -2765,9 +3088,12 @@ static void service_pending_cleanup() {
     rls(g_cx.pso_advect); rls(g_cx.delta2);
     rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
     g_cx.snap_ready = false;
-    rls(g_cx.root); rls(g_cx.fence);
+    rls(g_cx.root); rls(g_cx.fence); rls(g_cx.sub_fence);
     g_cx.ready = false; g_cx.pending = false; g_cx.copy_recorded = false;
     g_cx.slot = 0; g_cx.fence_val = 0; g_cx.pending_at = 0;
+    g_cx.sub_val = 0;
+    for (unsigned s = 0; s < kCxSlots; ++s) g_cx.slot_epoch[s] = 0;
+    g_list_slots_n = 0;
 
     if (g_eq.held) { g_eq.held->Release(); g_eq.held = nullptr; }
     rls(g_eq.list); rls(g_eq.alloc); rls(g_eq.queue); rls(g_eq.readback); rls(g_eq.fence);
@@ -2914,7 +3240,7 @@ static void on_init_swapchain(reshade::api::swapchain *, bool resize) {
 static void on_destroy_device(reshade::api::device *dev) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     if (dev->get_api() == reshade::api::device_api::d3d12 &&
-        reinterpret_cast<ID3D12Device *>(dev->get_native()) == g_device) {
+        same_device(reinterpret_cast<ID3D12Device *>(dev->get_native()), g_device)) {
         release_state("device destroyed");
         g_device = nullptr;
     }
@@ -2924,12 +3250,20 @@ static void on_init_device(reshade::api::device *dev) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     if (dev->get_api() != reshade::api::device_api::d3d12) return;
     auto *d = reinterpret_cast<ID3D12Device *>(dev->get_native());
-    if (g_device != nullptr && d != g_device) release_state("new device");
-    if (g_device != d) {
+    if (g_device != nullptr && !same_device(d, g_device)) release_state("new device");
+    if (!same_device(g_device, d)) {
         g_device = d;
         logf("[NRPRE] captured ID3D12Device=%p", (void *)g_device);
     }
 }
+
+#ifndef NR_STANDALONE
+static void on_init_command_queue(reshade::api::command_queue *queue) {
+    if (queue->get_device()->get_api() != reshade::api::device_api::d3d12) return;
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    install_submission_hook(reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()));
+}
+#endif
 
 static void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
                        const reshade::api::rect *, const reshade::api::rect *,
@@ -3020,8 +3354,8 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     static unsigned pending_report = 0;
     if (g_resize_pending) {
         if (g_diagnostics && (++pending_report % 120u) == 0u)
-            logf("[NRPRE] cleanup still pending: lists=%zu fences=%zu signal_failed=%d",
-                 g_recorded_lists.size(), g_submission_fences.size(),
+            logf("[NRPRE] cleanup still pending: lists=%zu unsubmitted=%zu fences=%zu signal_failed=%d",
+                 g_recorded_lists.size(), g_recorded_lists.pending_count(), g_submission_fences.size(),
                  (int)g_submission_failed);
         return;
     }
@@ -3063,6 +3397,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         g_self_module = hModule;
         if (!reshade::register_addon(hModule)) return FALSE;
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
+        reshade::register_event<reshade::addon_event::init_command_queue>(on_init_command_queue);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 #ifndef NR_STANDALONE
@@ -3070,10 +3405,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 #endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
         reshade::register_event<reshade::addon_event::present>(on_present);
-        logf("[NRPRE] addon registered (NR at render resolution -- configure in the ReShade overlay)");
+        logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1 -- configure in the ReShade overlay)");
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
+        reshade::unregister_event<reshade::addon_event::init_command_queue>(on_init_command_queue);
         reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(load_settings);

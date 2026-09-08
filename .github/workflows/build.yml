@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Test recording lifecycle
+        run: sh tests/run.sh
       - name: Install Windows cross compiler
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
       - name: Fetch pinned SDK headers and source

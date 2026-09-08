@@ -370,7 +370,10 @@ void CSHistogram(uint3 tid : SV_DispatchThreadID) {
   // Bins 129/130: depth convention. Sample the centre of the screen, where
   // geometry is almost always present, and see which end of the range it sits
   // at -- reversed-Z puts near geometry at ~1.0, classic depth at ~0.
-  if (all(px == (Size / 2))) {
+  // px walks a 4px grid, so the target must be snapped down to it: at
+  // 1366 wide, 1366/2 = 683 is not on the grid and the check never matched.
+  const uint2 center = (Size / 2) & uint2(0xFFFFFFFCu, 0xFFFFFFFCu);
+  if (all(px == center)) {
     const float d = Proxy.Load(int3(px, 0)).r;      // depth is bound as t1 here
     InterlockedAdd(Hist[129], (uint)(saturate(d) * 1000.0));
     InterlockedAdd(Hist[130], 1);

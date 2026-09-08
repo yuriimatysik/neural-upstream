@@ -1,5 +1,9 @@
 # neural-upstream
 
+This fork combines the Stellar Blade fixes from upstream issue #3 with the
+community-runtime fixes in PR #4. See [BUILDING.md](BUILDING.md) for pinned
+dependencies, automated Windows DLL builds, installation and GPU test coverage.
+
 DLSS 5 Neural Rendering runs at output resolution, after the upscaler. This
 ReShade add-on moves it **upstream**: the network runs on the game's
 render-resolution colour buffer, and its result is handed to the game's own DLSS

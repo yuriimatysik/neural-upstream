@@ -11,6 +11,12 @@ external/
 *.bak*
 *.backup-*
 
+# Local diagnostics and editor tooling
+/ReShade*.log
+/.serena/
+
 # proxy build output
 proxy/version.dll
 proxy/nvngx.dll.nr
+*.headers.txt
+SHA256SUMS

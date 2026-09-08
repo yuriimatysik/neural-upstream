@@ -14,7 +14,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-g++ -shared -std=c++20 -O2 -DNDEBUG -w -DNR_STANDALONE \
+"${CXX:-g++}" -shared -std=c++20 -O2 -DNDEBUG -DNR_STANDALONE \
   -I proxy/shim -I proxy -I external/ngx/include -I external/minhook/include \
   -o proxy/nvngx.dll.nr src/addon.cpp proxy/shim.impl.cpp proxy/satellite.cpp \
   external/minhook/src/hook.c external/minhook/src/buffer.c \
@@ -22,7 +22,7 @@ g++ -shared -std=c++20 -O2 -DNDEBUG -w -DNR_STANDALONE \
   -static -static-libgcc -static-libstdc++ \
   -ld3d12 -ld3dcompiler -ldxgi -lpsapi -lkernel32
 
-g++ -shared -std=c++20 -O2 -DNDEBUG -w -I external/minhook/include \
+"${CXX:-g++}" -shared -std=c++20 -O2 -DNDEBUG -I external/minhook/include \
   -o proxy/version.dll proxy/nrproxy.cpp \
   external/minhook/src/hook.c external/minhook/src/buffer.c \
   external/minhook/src/trampoline.c external/minhook/src/hde/hde64.c \

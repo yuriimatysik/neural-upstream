@@ -450,7 +450,11 @@ static const unsigned kHistBins = 132;   // 0..127 luminance, 128 HDR, 129/130 d
 // measurement, the scene histogram is the fallback for titles that do not hand
 // one over, and the manual sliders are the floor. The user picks "Auto" or not;
 // which source serves it is not a decision worth exposing.
-static bool  g_use_exp_tex = true;      // internal: disabled on repeated failure
+// A texture last used on DIRECT/COMPUTE must be in COMMON before a COPY queue
+// can access it. The NGX parameter does not expose its current state, so copying
+// this game-owned resource would require guessing a D3D12 StateBefore and can
+// remove the device. Keep the unsafe path disabled and use the histogram below.
+static bool  g_use_exp_tex = false;
 static unsigned g_exp_fresh = 0;        // frames since the last game-exposure read
 static bool  g_exp_from_game = false;   // read the game's exposure texture (opt-in: needs its resource state)
 static bool  g_auto_pw = false;            // UI: derive paper white from the scene
@@ -2664,7 +2668,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::BeginDisabled(!g_codec_on);
     changed |= ImGui::Checkbox("Auto", &g_auto_pw);
     ImGui::SameLine();
-    ImGui::TextDisabled("(uses the game's own exposure, or the scene if it has none)");
+    ImGui::TextDisabled("(uses the scene luminance histogram)");
     ImGui::SetItemTooltip("Measures the scene's own brightness and sets the reference white "
                           "from it, instead of a fixed value borrowed from another game.");
     if (g_auto_pw) {

@@ -7,6 +7,143 @@ dead ends cost more than the answers did.
 Hardware: RTX 4070 Ti (Ada, `sm_89`). Titles: GTA V Enhanced, Bright Memory:
 Infinite benchmark.
 
+## Avatar visibility report resolved: Effect strength was zero
+
+The user reports no visible NR effect with `ReShade (4).log`. Contrary to the
+initial suspicion of a rejected DLSS handle, the log explicitly allows feature
+13 at module 1, creates NR through the snippet route and records successful
+Color rebinds. The final heartbeat reaches #3181 with `finalvalid=1`,
+`erfail=0`, `grfail=0`, `unknown_bypass=0` and `fg_bypass=5848`. GPU timings
+continue around 3.6 ms for encode/NR/decode. This proves execution, not that its
+effect reaches the displayed image. The user subsequently confirmed that Effect
+strength had remained at zero from the earlier diagnostic test. The missing
+effect report was therefore explained by the saved setting, not evidence of a
+feature-routing regression. The overlay now explicitly states when strength is
+zero. The user has not separately confirmed the original 4x flicker is resolved
+with nonzero strength; keep that visual check outstanding.
+
+The old settings/heartbeat logs omit EffectStrength and Transfer, both of which
+can suppress the visible result and persist across binary replacements. The
+user's confirmation identifies the strength used in this session. A previously
+considered possibility was a legitimate DLSS call nested within an excluded FG
+chain: v1 suppresses that whole chain. There is no evidence in this log for that
+mechanism, and the saved zero strength explains the reported lack of effect.
+
+`visibility diagnostics v1` adds strength/transfer/enabled values to heartbeats,
+strength/transfer/intensity/rebind to loaded settings, and a bounded report plus
+`nested_dlss_bypass` counter for known DLSS calls suppressed under another feature.
+It makes no change to routing, shaders or saved settings. This is diagnostic
+instrumentation, not a claimed repair of the visible regression or flicker.
+
+## Avatar MFG interaction: NGX feature isolation v1
+
+The user confirms: no flicker with NR and FG off, no flicker with NR and 2x,
+and no flicker at MFG 4x with NR disabled. NR plus MFG 4x flickers, including
+at Effect strength 0. This isolates the failing combination, not its precise
+GPU mechanism. The adjacent MFGAdaUnlock-RenoDx repository was inspected and
+is unchanged by this candidate.
+
+`ReShade (3).log` shows hooks on `_nvngx.dll`, `sl.common.dll`, and the cached
+DLSS/DLSSD providers. The filename exclusion for `dlssg` cannot exclude FG
+calls routed through those shared exports. `eval_dispatch` had no feature-type
+check: any evaluation with readable Color/Depth/MotionVectors could run NR or
+reuse `final_tex`, change jitter history and rebind Color. At 00:25:51.880,
+FrameGeneration (feature 11) is created for 4x; additional tracked queue work
+appears immediately afterwards. Earlier FG-on sections contain repeated Color
+rebinds on a second thread. The old diagnostic omits the handle/type on those
+lines, so it cannot prove which particular evaluations were wrongly processed.
+
+There is also a definite identity collision in the log: Ray Reconstruction
+(feature 13) and FrameGeneration (11) both have numeric handle Id 1, later Id 2.
+The old depth cache used this Id as its sole key. It is not a feature type or a
+globally unique handle. See NVIDIA's [NGX feature definitions](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h).
+
+The new registry records successful CreateFeature results by provider and opaque
+handle address, and retires them after successful ReleaseFeature. Only known
+SuperSampling (1) and RayReconstruction (13) handles enter NR. Other features
+bypass the entire nested chain before Color inspection, resource allocation,
+jitter tracking or rebind. Unknown proxy handles pass through, allowing an inner
+provider with an observed creation contract to process legitimate DLSS. An
+unobserved creation never authorizes NR on the basis of DLSS-looking parameters.
+Depth flags use the same provider/handle contract and survive NR-only cleanup.
+
+All hooked evaluate providers now require creation/release observation. A provider
+without working lifecycle hooks is left untouched. Features created before hook
+installation remain passthrough until recreated, so validation must establish
+that the NR effect remains active as well as checking that flicker disappears.
+Log marker: `NGX feature isolation v1`; per-handle `feature gate` messages identify
+allow/bypass, while heartbeat `fg_bypass` and `unknown_bypass` count those paths.
+The new host regression covers colliding numeric Ids, provider separation,
+release/address reuse, missing flags and rejection of non-upscaler features.
+Visual validation in Avatar is still required; no claim of a solved artifact.
+
+## Avatar follow-up: v3 still flickers with Effect strength 0
+
+`ReShade (2).log` contains 155 heartbeats from descriptor lifetime v3. Every
+sample has `descbypass=0`, `descerr=0`, `erfail=0`, `grfail=0`, cadence 1,
+async 0, and game-provided reversed depth. Paper white is fixed at 0.6716,
+with no automatic exposure updates. Descriptor pages settle at six, then seven
+near the end; the log does not show unbounded growth or allocation bypass.
+The user reports the same artifact with Effect strength set to zero. The
+heartbeat does not include strength, so that setting is established by the
+user's observation, not by the recorded fields.
+
+This is a failed visual validation of the v3 candidate, not evidence that the
+artifact is fixed or that every GPU resource is correctly synchronized. Strength
+zero still runs NR, the codec and Color rebind; it is not full passthrough and
+cannot rule out those execution/resource paths or their interaction with frame
+generation. No fourth runtime change is justified by the heartbeat alone.
+
+At this stage the next controlled comparison was frame generation disabled while
+NR remains enabled, with other settings held constant. MFG Unlock is loaded;
+it reports a temporal patch applied to the cached provider and unsupported
+temporal descriptors in other runtime copies. Presented-frame counts change
+from zero to three, then one. These reports alone do not establish which
+runtime generated the flashing frame or whether FG was active throughout.
+The later FG-off, 2x and NR-off comparisons are recorded above.
+
+## Avatar intermittent partial-screen flicker: descriptor lifetime v3
+
+The follow-up `ReShade (1).log` confirms the depth-guide build did not resolve
+the reported flicker. All 219 heartbeats have `depthinv=1 depthsrc=game`, cadence
+1 and async 0. Exposure stays fixed at `pw=0.6716`, `knee=0.800`, `upd=88` for
+about 70 seconds; the user reports flicker with automatic exposure disabled.
+Three queue identities submit tracked work after the final completed cleanup.
+These records do not capture the flashing pixels or prove a particular GPU race.
+
+The descriptor ring introduced before this log had several real lifetime holes:
+it did not protect unsubmitted recordings, silently stopped tracking after 16
+command lists, forgot descriptors on first submission (despite possible later
+reexecution), and compared signals from independent queues on a shared fence.
+It also skipped individual codec passes on ring exhaustion without propagating
+failure, allowing old output to be treated as current. This supersedes the earlier
+claim that per-slot stamping made the race impossible.
+
+Descriptor lifetime v3 allocates descriptor pages per recording. Contents remain
+owned until successful Reset/destruction; recycling additionally waits on each
+queue's own completion value, including repeated executions. The complete
+evaluation's descriptor capacity is checked before snapshots/encode/NR. A failed
+preflight uses the game's current Color and invalidates NR history instead of
+skipping one pass. The page pool retains its high-water allocation until cleanup;
+more concurrently live recordings can therefore consume more descriptor memory.
+The histogram clear now has a UAV barrier before the histogram atomics.
+
+The old `erfail=0` also cannot rule out NR errors: the rebind path returned before
+incrementing this counter. Errors are now counted at NR evaluation, terminate
+repeat evaluation, and prevent decode/rebind of stale output. New heartbeat fields
+are `descpages`, `descbypass`, and `descerr`; these are resource diagnostics, not
+pixel-level corruption detection. The build marker is `descriptor lifetime v3`.
+
+References: [descriptor heap synchronization](https://learn.microsoft.com/en-us/windows/win32/direct3d12/descriptor-heaps-overview#synchronization)
+and [independent queue timelines](https://learn.microsoft.com/en-us/windows/win32/direct3d12/user-mode-heap-synchronization).
+Host regressions exercise pending and repeatedly submitted recordings, Reset,
+three out-of-order queues, device removal, and more than 16 live owners. ReShade
+and standalone cross-builds pass; Windows wrapper/GPU behavior and visual success
+still require testing in Avatar. If flicker remains, compare Effect strength 0
+with NR still enabled, then frame generation disabled, one variable at a time.
+The log also contains MFG Unlock temporal-patch warnings; those are not proof
+that frame generation caused the artifact.
+
 ## Avatar sky flicker: stable depth guides (September 2026)
 
 The user reports that the submission-tracking build works again in Black Flag
@@ -296,13 +433,10 @@ is switched off, which is teardown. Reading it as a failure cost hours.
 - **The descriptor ring was eight slots.** Three dispatches a frame with the CPU
   two or three frames ahead of the GPU left ~2.7 frames of headroom, so slots were
   being recycled while still in flight. It had been that way from the first day and
-  is the most likely cause of artefacts blamed on other things. Now 64, and the
-  size is no longer what carries the safety: every submission stamps the covering
-  fence value onto the slots the lists it submitted actually wrote (tracked per
-  list, so one list finishing never clears a slot another still owns), and the CPU
-  that finds a slot in flight skips the pass instead of rewriting descriptors the
-  GPU is still reading. A bigger ring is mitigation; the per-slot fence is what
-  makes the race impossible.
+  was suspected in artefacts blamed on other things. Enlarging it to 64 and adding
+  per-slot fence stamps still left lifetime holes (see descriptor lifetime v3
+  above). It is now a pool of 64-slot pages with recording ownership and separate
+  completion checks for every submitting queue, rather than one global ring.
 - **43% of evaluates were handed the raw colour.** The game issues more than one
   evaluate per frame and only the first claims it; the rest took the skipped-frame
   path and threw the enhancement away, even though `final_tex` already held that

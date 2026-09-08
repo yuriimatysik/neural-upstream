@@ -18,6 +18,8 @@
 #include <nvsdk_ngx_params.h>
 #include "codec.hlsl.h"
 #include "submission_tracker.h"
+#include "descriptor_lifetime.h"
+#include "feature_registry.h"
 #include <atomic>
 #include <new>
 #include <vector>
@@ -129,6 +131,7 @@ static unsigned g_net_w, g_net_h;
 static unsigned g_setup_w = 0, g_setup_h = 0;
 static std::recursive_mutex g_state_mutex;
 static bool g_resize_pending = false;
+static bool g_submission_failed = false;
 static bool install_submission_hook(ID3D12CommandQueue *queue);
 static bool prepare_recording(ID3D12GraphicsCommandList *cmd);
 static void track_recording(ID3D12GraphicsCommandList *cmd);
@@ -435,9 +438,13 @@ static bool  g_hdr_detected = true;    // latched: proven HDR, never unlatched
 static unsigned g_hdr_samples = 0;
 static bool  g_depth_reversed = true;  // fixed fallback when NGX flags are unavailable
 static bool  g_depth_from_game = false;
-// Creation flags may be absent from the evaluate parameter block. Keep the
-// game's contract across NR-only cleanup; swapchain resize need not recreate DLSS.
-static std::unordered_map<unsigned, unsigned> g_dlss_create_flags;
+// Creation flags may be absent from evaluate. Keep the full creation contract
+// across NR-only cleanup; retire it when its own provider releases the handle.
+static nr::FeatureRegistry g_features;
+static thread_local unsigned t_ngx_provider = 0;
+static unsigned long long g_fg_bypass = 0, g_unknown_bypass = 0;
+static unsigned long long g_nested_dlss_bypass = 0;
+static_assert(NVSDK_NGX_Feature_SuperSampling == 1 && NVSDK_NGX_Feature_RayReconstruction == 13);
 static bool  g_guides_valid = false;
 static float g_knee_measured = 0.75f;
 
@@ -461,13 +468,12 @@ static bool read_dlss_flags(const NVSDK_NGX_Parameter *params, unsigned &flags) 
 static void update_depth_guide(const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params) {
     unsigned flags = 0;
     bool known = false;
-    const auto saved = g_dlss_create_flags.find(feat_id(feat));
-    if (saved != g_dlss_create_flags.end()) {
-        flags = saved->second;
+    const auto *saved = g_features.find(t_ngx_provider, feat);
+    if (saved && saved->flags_valid) {
+        flags = saved->flags;
         known = true;
     } else {
         known = read_dlss_flags(params, flags);
-        if (known) g_dlss_create_flags[feat_id(feat)] = flags;
     }
     const bool reversed = !known || (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
     if (reversed != g_depth_reversed) {
@@ -686,14 +692,13 @@ static void exp_queue_tick(ID3D12Device *dev, ID3D12CommandQueue *gfx) {
 // ---- colour-codec plumbing ------------------------------------------------
 // Two compute passes wrap the NR evaluate: encode the game's scene-linear HDR
 // into the bounded sRGB domain DLSSNR was trained on, then decode back.
-// The ring has to outlast the frames the CPU runs ahead of the GPU: a slot reused
-// while its dispatch is still in flight hands the shader another frame's views.
-// Eight was already only ~2.7 frames of headroom at three dispatches a frame, and
-// the snapshot path takes it to six a frame -- 1.3 frames, which corrupts reliably.
-// The heap is kCxSlots * kCxDescriptorsPerSlot descriptors and nothing else,
-// so this is cheap. Keep the layout in one place: t0..t4, u0, u1.
+// Each recording owns descriptor pages. Pages are recycled only after Reset or
+// destruction AND completion of every queue that submitted the recording.
 static const unsigned kCxSlots = 64;
 static const unsigned kCxDescriptorsPerSlot = 7;
+// At most nine slots: three snapshots, histogram clear+dispatch, encode,
+// advect, decode/apply and delta capture. Reserve before recording any of them.
+static const unsigned kCxBatchSlots = 12;
 
 struct Codec {
     ID3D12RootSignature *root = nullptr;
@@ -721,71 +726,80 @@ struct Codec {
     bool   exp_is_texture = false;         // the pending copy is the exposure texel
     ID3D12DescriptorHeap *clear_heap = nullptr;   // non-shader-visible, for the UAV clear
     UINT inc = 0;
-    unsigned slot = 0;              // ring so in-flight frames keep their descriptors
-    // The ring's headroom is a size argument, not a proof: on a long hitch the
-    // GPU can fall further behind than 64 dispatches. sub_fence is signalled by
-    // the submission hook once each tracked list has executed; slot_epoch[S]
-    // holds the value that covers slot S's last dispatch, and a write to S that
-    // finds it uncompleted skips one frame instead of corrupting in-flight work.
-    ID3D12Fence *sub_fence = nullptr;
-    UINT64 sub_val = 0;
-    UINT64 slot_epoch[kCxSlots] = {};
+    unsigned slot = 0;
     bool ready = false;
 } g_cx;
 
-// Which ring slots each tracked list wrote since its last submission. The
-// submission hook stamps the covering fence value onto exactly those slots, so
-// one list finishing never clears a slot another list still owns.
-struct ListSlots { std::uint64_t id; std::uint64_t mask; };
-static ListSlots g_list_slots[16];
-static unsigned g_list_slots_n = 0;
-static void list_slot_mark(std::uint64_t id, unsigned slot) {
-    for (unsigned i = 0; i < g_list_slots_n; ++i)
-        if (g_list_slots[i].id == id) { g_list_slots[i].mask |= (1ull << slot); return; }
-    if (g_list_slots_n < 16) {
-        g_list_slots[g_list_slots_n].id = id;
-        g_list_slots[g_list_slots_n].mask = (1ull << slot);
-        ++g_list_slots_n;
-    }
+struct DescriptorPage {
+    nr::DescriptorLifetime lifetime;
+    ID3D12DescriptorHeap *heap = nullptr;
+    unsigned used = 0;
+};
+static std::vector<DescriptorPage> g_descriptor_pages;
+static size_t g_descriptor_page = 0;
+static uint64_t g_descriptor_recording = 0;
+static unsigned g_descriptor_end = 0;
+static unsigned g_descriptor_bypass = 0, g_descriptor_invariant = 0;
+static bool g_descriptor_failed = false;
+static uint64_t descriptor_completed(uint64_t fence) {
+    return reinterpret_cast<ID3D12Fence *>(fence)->GetCompletedValue();
 }
-// Consumed on submission: the stamped fence value covers the execution just
-// recorded, and a later re-execution of a closed list only matters after a
-// ring wrap -- at which point the slot is reused only once this fence has
-// completed, i.e. after the earlier execution already read the descriptors.
-static std::uint64_t list_slot_take(std::uint64_t id) {
-    for (unsigned i = 0; i < g_list_slots_n; ++i)
-        if (g_list_slots[i].id == id) {
-            const std::uint64_t m = g_list_slots[i].mask;
-            g_list_slots[i].mask = 0;
-            return m;
-        }
-    return 0;
-}
-static void list_slot_drop(std::uint64_t id) {
-    for (unsigned i = 0; i < g_list_slots_n; ++i)
-        if (g_list_slots[i].id == id) {
-            g_list_slots[i] = g_list_slots[g_list_slots_n - 1];
-            --g_list_slots_n;
-            return;
-        }
+static void cx_discard_recording(uint64_t id) {
+    for (auto &page : g_descriptor_pages) page.lifetime.discard(id);
 }
 
-// Reserve the next ring slot. If it is still in flight -- the fence stamped on
-// the list that recorded its last dispatch has not completed -- rewriting its
-// descriptors would race the GPU, so the ring is rewound and the caller must
-// skip the pass it was about to record. The frame then falls back to the
-// previous frame's stored content, the same path a cadence skip already uses.
+static bool cx_begin_batch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev) {
+    g_descriptor_failed = false;
+    const uint64_t id = recording_id(cmd);
+    if (!id || g_submission_failed) return false;
+    size_t chosen = g_descriptor_pages.size();
+    for (size_t i = 0; i < g_descriptor_pages.size(); ++i) {
+        auto &page = g_descriptor_pages[i];
+        if (page.lifetime.owner == id && page.used + kCxBatchSlots <= kCxSlots) {
+            chosen = i;
+            break;
+        }
+    }
+    if (chosen == g_descriptor_pages.size()) {
+        for (size_t i = 0; i < g_descriptor_pages.size(); ++i) {
+            auto &page = g_descriptor_pages[i];
+            if (page.lifetime.reusable(descriptor_completed)) {
+                page.lifetime.assign(id);
+                page.used = 0;
+                chosen = i;
+                break;
+            }
+        }
+    }
+    if (chosen == g_descriptor_pages.size()) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = kCxSlots * kCxDescriptorsPerSlot;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        DescriptorPage page;
+        if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&page.heap)))) return false;
+        page.lifetime.assign(id);
+        g_descriptor_pages.push_back(std::move(page));
+    }
+    auto &page = g_descriptor_pages[chosen];
+    g_descriptor_page = chosen;
+    g_descriptor_recording = id;
+    g_cx.heap = page.heap; // borrowed; the page pool owns the COM reference
+    g_cx.slot = page.used;
+    g_descriptor_end = page.used + kCxBatchSlots;
+    return true;
+}
+
 static bool cx_slot_acquire(ID3D12GraphicsCommandList *cmd, unsigned &slot) {
-    slot = g_cx.slot;
-    g_cx.slot = (g_cx.slot + 1) % kCxSlots;
-    if (g_cx.sub_fence == nullptr) return true;
-    if (g_cx.slot_epoch[slot] != 0 &&
-        g_cx.sub_fence->GetCompletedValue() < g_cx.slot_epoch[slot]) {
-        g_cx.slot = slot;
+    if (!g_cx.heap || g_cx.slot >= g_descriptor_end ||
+        recording_id(cmd) != g_descriptor_recording) {
+        g_descriptor_failed = true;
+        ++g_descriptor_invariant;
+        logf("[NRPRE] descriptor batch invariant failed; discarding codec output");
         return false;
     }
-    g_cx.slot_epoch[slot] = 0;
-    if (const uint64_t id = recording_id(cmd)) list_slot_mark(id, slot);
+    slot = g_cx.slot++;
+    g_descriptor_pages[g_descriptor_page].used = g_cx.slot;
     return true;
 }
 
@@ -908,13 +922,6 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
         logf("[NRPRE] codec: decode PSO failed"); return false;
     }
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kCxSlots * kCxDescriptorsPerSlot;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_cx.heap)))) {
-        logf("[NRPRE] codec: descriptor heap failed"); return false;
-    }
     g_cx.inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     pd.CS.pShaderBytecode = hist_cs->GetBufferPointer();
@@ -967,7 +974,6 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_cx.exp_rb));
 
         dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cx.fence));
-        dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cx.sub_fence));
 
         // ClearUnorderedAccessViewUint needs a CPU handle from a heap that is
         // NOT shader visible, in addition to the shader-visible GPU handle.
@@ -1287,7 +1293,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
 
     // Resize detection must precede setup, snapshots, codec allocation and any
     // cached output selection. A pending reset always passes the game through.
-    if (g_resize_pending)
+    if (g_resize_pending || g_submission_failed)
         return t_orig_eval(cmd, feat, params, cb);
     unsigned color_w = 0, color_h = 0;
     if (params && cmd) {
@@ -1329,16 +1335,21 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             if (g_diagnostics)
             logf("[NRPRE] HB #%llu handle=%p | pw=%.4f meas=%.4f valid=%d upd=%u "
                  "| hdr=%u det=%d knee=%.3f kmeas=%.3f | expfresh=%u fromgame=%d "
-                 "| net=%ux%u finalvalid=%d | cad=%d async=%d | erfail=%u grfail=%u passthru=%u "
-                 "| depthinv=%d depthsrc=%s",
+                 "| net=%ux%u finalvalid=%d | enabled=%d strength=%.3f transfer=%.3f "
+                 "| cad=%d async=%d | erfail=%u grfail=%u passthru=%u "
+                 "| depthinv=%d depthsrc=%s | descpages=%zu descbypass=%u descerr=%u "
+                 "| fg_bypass=%llu unknown_bypass=%llu nested_dlss_bypass=%llu",
                  (unsigned long long)hb, (void *)g_nr_handle,
                  g_paper_white, g_pw_measured, (int)g_pw_valid, g_pw_updates,
                  g_hdr_mode, (int)g_hdr_detected, g_knee, g_knee_measured,
                  g_exp_fresh, (int)g_exp_from_game,
                  g_net_w, g_net_h, (int)g_final_valid,
+                 (int)g_nr_enabled, g_effect_strength, g_transfer,
                  g_skip_n, (int)g_async_net,   // which mode was actually running, always
                  g_er_fail, g_gr_fail, g_pass_frames,
-                 (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback");
+                 (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback",
+                 g_descriptor_pages.size(), g_descriptor_bypass, g_descriptor_invariant,
+                 g_fg_bypass, g_unknown_bypass, g_nested_dlss_bypass);
     }
     if (params != nullptr && (g_logged < 12 || !g_setup_done)) {
         if (g_logged == 0) probe_slots(params, NVSDK_NGX_Parameter_Color);
@@ -1395,6 +1406,21 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         ID3D12Resource      *in  = hi ? dst_col        : src;
 
         if (in && dep && mv) {
+            const bool use_codec = g_codec_on && !hi && g_device != nullptr
+                                   && codec_init(g_device, w_net, h_net);
+            // Preflight the entire evaluation before snapshots, encode or NR.
+            // Allocation failure must pass the current game input through, never
+            // skip an individual pass and pretend its old output is current.
+            if ((g_codec_on && !hi && !use_codec) ||
+                (g_cx.ready && !cx_begin_batch(cmd, g_device))) {
+                ++g_descriptor_bypass;
+                g_final_valid = g_delta_valid = false;
+                g_reset_pending = true;
+                if (g_descriptor_bypass <= 3 || g_descriptor_bypass % 120 == 0)
+                    logf("[NRPRE] descriptor preflight failed; current input passthrough (%u)",
+                         g_descriptor_bypass);
+                return t_orig_eval(cmd, feat, params, cb);
+            }
             // Track only lists where this add-on is about to write GPU work.
             // Tracking every Color evaluate also tracked passthrough/disabled
             // evaluates; if one of those lists was discarded, resize cleanup
@@ -1549,9 +1575,6 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                      (void *)jout, (unsigned long long)jod.Width, jod.Height,
                      (void *)dep, (void *)mv);
             }
-            const bool use_codec = g_codec_on && !hi && g_device != nullptr
-                                   && codec_init(g_device, w_net, h_net);
-
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -1590,6 +1613,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     er = (hi ? g_snip_eval : g_nr_eval)(cmd, hh, pp, nullptr);
                     uav_barrier(cmd, out);
                     prof_mark(cmd, 2);
+                    if (er != NVSDK_NGX_Result_Success) break;
                 }
                 if (g_async_net && g_cx.snap_ready) {
                     // back to UAV so the next frame's snapshot can write them again
@@ -1601,9 +1625,18 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 ++g_eval_count;
-                g_reset_pending = false;   // the network has now seen it
+                g_reset_pending = (er != NVSDK_NGX_Result_Success);
+                if (er != NVSDK_NGX_Result_Success) {
+                    ++g_er_fail;
+                    g_final_valid = g_delta_valid = false;
+                    if (g_er_fail <= 3) ring_dump("NR evaluate failed before rebind");
+                    if (g_er_fail <= 20 || g_er_fail % 200 == 0)
+                        logf("[NRPRE] NR Evaluate failed 0x%08X; current input passthrough (%u)",
+                             (unsigned)er, g_er_fail);
+                    if (use_codec) barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);
+                }
 
-                if (use_codec) {
+                if (use_codec && er == NVSDK_NGX_Result_Success) {
                     barrier_transition(cmd, out, kUAV, kSRV);          // decode reads NR output
                     // Uniform mode: this frame is developed from the delta that is
                     // already stored, exactly as the frames between are, so no frame
@@ -1668,7 +1701,12 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // it anyway is stale colour against fresh motion, which DLSS resolves as
             // ghosting and judder. Passing the game's own colour through instead
             // costs the NR look on that frame but keeps the input aligned.
-            ID3D12Resource *feed = use_codec ? (g_final_valid ? g_cx.final_tex : nullptr) : out;
+            if (g_descriptor_failed) {
+                g_final_valid = g_delta_valid = false;
+                g_reset_pending = true;
+            }
+            ID3D12Resource *feed = (er != NVSDK_NGX_Result_Success || g_descriptor_failed)
+                ? nullptr : (use_codec ? (g_final_valid ? g_cx.final_tex : nullptr) : out);
             const bool delta_fed = use_codec && g_delta_reuse && g_delta_valid && g_skip_n > 1;
             // !run_now covers two different situations and they need opposite
             // answers. One is a frame the cadence genuinely skipped. The other is a
@@ -1728,14 +1766,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             ring_push(tick, feed, src, (unsigned)er, 0u, w_net, h_net,
                       run_now, use_codec, g_final_valid, g_delta_valid, feed == nullptr);
-            if (er != NVSDK_NGX_Result_Success) {
-                ++g_er_fail;
-                if (g_er_fail <= 3) ring_dump("fallo del evaluate de la red");
-                if (g_er_fail <= 20 || (g_er_fail % 200) == 0)
-                    logf("[NRPRE] *** NR Evaluate(%s) FAILED -> 0x%08X  (fallo #%u, tick %llu, run=%d codec=%d net=%ux%u)",
-                         hi ? "HI" : "LO", (unsigned)er, g_er_fail,
-                         (unsigned long long)tick, (int)run_now, (int)use_codec, w_net, h_net);
-            } else if (g_eval_logged < 5) {
+            if (er == NVSDK_NGX_Result_Success && g_eval_logged < 5) {
                 logf("[NRPRE] 2c: NR Evaluate(%s) -> 0x%08X", hi ? "HI" : "LO", (unsigned)er);
                 ++g_eval_logged;
             }
@@ -1749,6 +1780,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
 // link in the chain and must pass straight through, or the network would run
 // twice on the same frame and the colour would be developed twice over.
 static thread_local int t_depth = 0;
+static thread_local unsigned t_bypassed_feature = ~0u;
 
 static NVSDK_NGX_Result eval_dispatch(unsigned idx, ID3D12GraphicsCommandList *cmd,
         const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params,
@@ -1756,15 +1788,66 @@ static NVSDK_NGX_Result eval_dispatch(unsigned idx, ID3D12GraphicsCommandList *c
 {
     PFN_Eval orig = g_orig_eval_n[idx];
     if (orig == nullptr) return NVSDK_NGX_Result_Fail;
-    if (t_depth > 0) return orig(cmd, feat, params, cb);   // nested: just forward
+    if (t_depth > 0) {
+        // Observe whether the non-DLSS nesting guard hides an actual upscaler.
+        // Do not infer that from repeated Color parameters on FG evaluations.
+        if (t_bypassed_feature != ~0u) {
+            std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+            const auto *nested = g_features.find(idx, feat);
+            if (nested && nested->allows_nr()) {
+                ++g_nested_dlss_bypass;
+                if (g_nested_dlss_bypass <= 3)
+                    logf("[NRPRE] nested DLSS bypass: outer feature=%u inner feature=%u module=%u handle=%p",
+                         t_bypassed_feature, nested->feature, idx, (void *)feat);
+            }
+        }
+        return orig(cmd, feat, params, cb);
+    }
 
-    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    std::unique_lock<std::recursive_mutex> lock(g_state_mutex);
+    auto *contract = g_features.find(idx, feat);
+    if (!contract || !contract->allows_nr()) {
+        if (!contract) {
+            ++g_unknown_bypass;
+            static bool reported[kMaxNgx] = {};
+            if (!reported[idx]) {
+                reported[idx] = true;
+                logf("[NRPRE] feature gate: unknown handle=%p module=%u; passthrough until creation is observed",
+                     (void *)feat, idx);
+            }
+        } else {
+            if (contract->feature == NVSDK_NGX_Feature_FrameGeneration) ++g_fg_bypass;
+            if (!contract->reported) {
+                contract->reported = true;
+                logf("[NRPRE] feature gate: bypass feature=%u handle=%p module=%u (no NR work or Color rebind)",
+                     contract->feature, (void *)feat, idx);
+            }
+        }
+        // An unknown outer proxy may forward to a known core handle. Let that
+        // inner hook decide. A known non-DLSS feature suppresses the whole chain.
+        const bool known_other = contract != nullptr;
+        const unsigned bypassed_feature = contract ? contract->feature : ~0u;
+        lock.unlock();
+        const unsigned saved_bypassed_feature = t_bypassed_feature;
+        if (known_other) { ++t_depth; t_bypassed_feature = bypassed_feature; }
+        const NVSDK_NGX_Result result = orig(cmd, feat, params, cb);
+        if (known_other) { --t_depth; t_bypassed_feature = saved_bypassed_feature; }
+        return result;
+    }
+    if (!contract->reported) {
+        contract->reported = true;
+        logf("[NRPRE] feature gate: allow feature=%u handle=%p module=%u",
+             contract->feature, (void *)feat, idx);
+    }
     PFN_Eval saved = t_orig_eval;
+    const unsigned saved_provider = t_ngx_provider;
     t_orig_eval = orig;
+    t_ngx_provider = idx;
     ++t_depth;
     NVSDK_NGX_Result r = eval_body(cmd, feat, params, cb);
     --t_depth;
     t_orig_eval = saved;
+    t_ngx_provider = saved_provider;
     return r;
 }
 
@@ -1799,22 +1882,22 @@ static float pget_f(const NVSDK_NGX_Parameter *p, const char *k) {
 
 typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_Create)(ID3D12GraphicsCommandList *, NVSDK_NGX_Feature,
         NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
-static PFN_Create g_orig_create = nullptr;
+static PFN_Create g_orig_create_n[kMaxNgx] = {};
+static PFN_ReleaseFeature g_orig_release_n[kMaxNgx] = {};
 
-static NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList *cmd, NVSDK_NGX_Feature id,
+template <unsigned Index>
+static NVSDK_NGX_Result NVSDK_CONV hk_create_t(ID3D12GraphicsCommandList *cmd, NVSDK_NGX_Feature id,
         NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle **out)
 {
     const bool dlss = id == NVSDK_NGX_Feature_SuperSampling || id == NVSDK_NGX_Feature_RayReconstruction;
     unsigned flags = 0;
     const bool flags_valid = dlss && read_dlss_flags(params, flags);
-    NVSDK_NGX_Result r = g_orig_create(cmd, id, params, out);
-    if (dlss && r == NVSDK_NGX_Result_Success && out && *out) {
+    NVSDK_NGX_Result r = g_orig_create_n[Index](cmd, id, params, out);
+    if (r == NVSDK_NGX_Result_Success && out && *out) {
         std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
-        const unsigned handle = feat_id(*out);
-        if (flags_valid) g_dlss_create_flags[handle] = flags;
-        else g_dlss_create_flags.erase(handle); // a recycled handle must not inherit flags
-        logf("[NRPRE] DLSS depth contract: handle=%u flags=0x%08X valid=%d",
-             handle, flags, (int)flags_valid);
+        g_features.created(Index, *out, static_cast<unsigned>(id), flags, flags_valid);
+        logf("[NRPRE] feature contract: module=%u feature=%u handle=%p id=%u flags=0x%08X valid=%d",
+             Index, (unsigned)id, (void *)*out, feat_id(*out), flags, (int)flags_valid);
     }
     char color[128], output[128], depth[128], mvec[128];
     describe(params, "DLSSNR.Color",  color,  sizeof color);
@@ -1822,12 +1905,29 @@ static NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList *cmd, NVS
     describe(params, "DLSSNR.Depth",  depth,  sizeof depth);
     describe(params, "DLSSNR.MVec",   mvec,   sizeof mvec);
     logf("[NRPRE] CreateFeature id=%d -> res=0x%08X handle=%u | NR W=%u H=%u ratio=%.3f preset=%d | %s | %s | %s | %s",
-         (int)id, (unsigned)r, (out && *out) ? feat_id(*out) : 0u,
+         (int)id, (unsigned)r, (r == NVSDK_NGX_Result_Success && out && *out) ? feat_id(*out) : 0u,
          pget_u(params, "DLSSNR.Width"), pget_u(params, "DLSSNR.Height"),
          pget_f(params, "DLSSNR.ScalingRatio"), (int)pget_u(params, "DLSSNR.Hint.Render.Preset"),
          color, output, depth, mvec);
     return r;
 }
+
+template <unsigned Index>
+static NVSDK_NGX_Result NVSDK_CONV hk_release_t(NVSDK_NGX_Handle *handle) {
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    const NVSDK_NGX_Result result = g_orig_release_n[Index](handle);
+    if (result == NVSDK_NGX_Result_Success) g_features.released(Index, handle);
+    return result;
+}
+
+static const PFN_Create kCreateThunks[kMaxNgx] = {
+    hk_create_t<0>, hk_create_t<1>, hk_create_t<2>, hk_create_t<3>,
+    hk_create_t<4>, hk_create_t<5>, hk_create_t<6>, hk_create_t<7>,
+};
+static const PFN_ReleaseFeature kReleaseThunks[kMaxNgx] = {
+    hk_release_t<0>, hk_release_t<1>, hk_release_t<2>, hk_release_t<3>,
+    hk_release_t<4>, hk_release_t<5>, hk_release_t<6>, hk_release_t<7>,
+};
 
 // ---- snippet-level hook: NR is created via nvngx_dlssnr.dll directly ----
 static PFN_Create g_orig_snip_create = nullptr;
@@ -2158,7 +2258,7 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
                            ID3D12Resource *t3, ID3D12Resource *t4)
 {
     unsigned slot = 0;
-    if (!cx_slot_acquire(cmd, slot)) return;   // in flight: keep the last pass
+    if (!cx_slot_acquire(cmd, slot)) return;   // preflight guarantees room
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
@@ -2263,7 +2363,7 @@ static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     if (cmd == nullptr || dev == nullptr || srcTex == nullptr || dstTex == nullptr) return;
     if (g_cx.pso_snap == nullptr || g_cx.heap == nullptr) return;
     unsigned slot = 0;
-    if (!cx_slot_acquire(cmd, slot)) return;   // in flight: keep the last snapshot
+    if (!cx_slot_acquire(cmd, slot)) return;   // preflight guarantees room
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_gpu(g_cx.heap);
     cpu.ptr += (SIZE_T)slot * kCxDescriptorsPerSlot * g_cx.inc;
@@ -2384,8 +2484,10 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_effect_strength = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoPaperWhite", v)) g_auto_pw = (v != 0);
     if (g_auto_pw && g_pw_valid) return;   // already converged, keep it
-    logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f",
-         (int)g_nr_enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee);
+    logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f "
+         "strength=%.3f transfer=%.3f intensity=%.3f rebind=%d",
+         (int)g_nr_enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee,
+         g_effect_strength, g_transfer, g_intensity, (int)g_rebind);
 }
 // Paper white shifts what the network is shown, so a preset nudges it rather than
 // setting it: auto exposure owns the absolute value, this only biases it.
@@ -2515,6 +2617,8 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                           "produced -- which sharpens, and can ring on hard edges. This "
                           "dilutes everything evenly; the setting above shapes what the "
                           "network does instead.");
+    if (g_effect_strength == 0.0f && g_codec_on)
+        ImGui::TextDisabled("Effect strength is zero: the NR effect is not visible.");
 
 
     ImGui::Spacing();
@@ -2691,6 +2795,7 @@ static void record_exposure_sample(ID3D12GraphicsCommandList *cmd, ID3D12Device 
     cmd->SetDescriptorHeaps(1, heaps);
     const UINT zero[4] = { 0, 0, 0, 0 };
     cmd->ClearUnorderedAccessViewUint(gpu, heap_cpu(g_cx.clear_heap), g_cx.hist, zero, 0, nullptr);
+    uav_barrier(cmd, g_cx.hist); // histogram atomics must follow the clear
 
     codec_dispatch(cmd, dev, g_cx.pso_hist, src, depth, nullptr, g_cx.proxy, w, h);
     uav_barrier(cmd, g_cx.hist);
@@ -2827,7 +2932,6 @@ struct SubmissionFence {
 };
 static nr::SubmissionTracker g_recorded_lists;
 static std::vector<SubmissionFence> g_submission_fences;
-static bool g_submission_failed = false;
 using PFN_ExecuteLists = void (STDMETHODCALLTYPE *)(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *);
 using PFN_ResetList = HRESULT (STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandAllocator *, ID3D12PipelineState *);
 static constexpr unsigned kMaxSubmissionHooks = 8;
@@ -2850,7 +2954,7 @@ public:
     ~RecordingToken() {
         std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
         g_recorded_lists.discard(id);
-        list_slot_drop(id);   // unsubmitted slot writes stop covering the ring
+        cx_discard_recording(id);
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
         if (!out) return E_POINTER;
@@ -2897,27 +3001,6 @@ static void STDMETHODCALLTYPE hk_execute_lists(ID3D12CommandQueue *queue, UINT c
         if (g_recorded_lists.submit(recording_id(lists[i]))) referenced = true;
     }
     if (!referenced) return;
-    // Descriptor ring: this submission completes the dispatches these lists
-    // recorded, so stamp the covering value onto exactly the slots they wrote.
-    if (g_cx.sub_fence != nullptr) {
-        const UINT64 v = ++g_cx.sub_val;
-        bool any = false;
-        for (UINT i = 0; i < count; ++i) {
-            const std::uint64_t mask = list_slot_take(recording_id(lists[i]));
-            for (unsigned s = 0; s < kCxSlots; ++s)
-                if ((mask >> s) & 1ull) g_cx.slot_epoch[s] = v;
-            any |= (mask != 0);
-        }
-        if (any) {
-            if (FAILED(queue->Signal(g_cx.sub_fence, v))) {
-                // Without the signal the epochs would block their slots forever.
-                for (unsigned s = 0; s < kCxSlots; ++s)
-                    if (g_cx.slot_epoch[s] == v) g_cx.slot_epoch[s] = 0;
-                g_submission_failed = true;
-                logf("[NRPRE] descriptor-ring fence signal failed");
-            }
-        }
-    }
     SubmissionFence *use = nullptr;
     for (auto &entry : g_submission_fences) if (entry.queue == queue) use = &entry;
     if (!use) {
@@ -2938,7 +3021,15 @@ static void STDMETHODCALLTYPE hk_execute_lists(ID3D12CommandQueue *queue, UINT c
         use = &g_submission_fences.back();
         logf("[NRPRE] tracking submitted NR work on queue=%p", (void *)queue);
     }
-    if (FAILED(queue->Signal(use->fence, ++use->value))) {
+    const UINT64 value = ++use->value;
+    for (UINT i = 0; i < count; ++i) {
+        const uint64_t id = recording_id(lists[i]);
+        for (auto &page : g_descriptor_pages)
+            page.lifetime.submit(id, reinterpret_cast<uint64_t>(use->fence), value);
+    }
+    // Every queue has its own timeline. Keep waits even after list Reset; a
+    // later submission on another queue cannot prove this queue has completed.
+    if (FAILED(queue->Signal(use->fence, value))) {
         g_submission_failed = true;
         logf("[NRPRE] cleanup fence signal failed; retaining resources");
     }
@@ -2954,7 +3045,7 @@ static HRESULT STDMETHODCALLTYPE hk_reset_list(ID3D12GraphicsCommandList *list,
     if (SUCCEEDED(result)) {
         const std::uint64_t id = recording_id(list);
         g_recorded_lists.discard(id);
-        list_slot_drop(id);
+        cx_discard_recording(id);
     }
     return result;
 }
@@ -3083,17 +3174,19 @@ static void service_pending_cleanup() {
     auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
     rls(g_nr_out); rls(g_nr_out_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
-    rls(g_cx.heap); rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);
+    for (auto &page : g_descriptor_pages) rls(page.heap);
+    g_descriptor_pages.clear();
+    g_cx.heap = nullptr;
+    g_descriptor_recording = 0;
+    g_descriptor_end = 0;
+    rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);
     rls(g_cx.pso_hist); rls(g_cx.pso_delta); rls(g_cx.pso_apply); rls(g_cx.pso_snap);
     rls(g_cx.pso_advect); rls(g_cx.delta2);
     rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
     g_cx.snap_ready = false;
-    rls(g_cx.root); rls(g_cx.fence); rls(g_cx.sub_fence);
+    rls(g_cx.root); rls(g_cx.fence);
     g_cx.ready = false; g_cx.pending = false; g_cx.copy_recorded = false;
     g_cx.slot = 0; g_cx.fence_val = 0; g_cx.pending_at = 0;
-    g_cx.sub_val = 0;
-    for (unsigned s = 0; s < kCxSlots; ++s) g_cx.slot_epoch[s] = 0;
-    g_list_slots_n = 0;
 
     if (g_eq.held) { g_eq.held->Release(); g_eq.held = nullptr; }
     rls(g_eq.list); rls(g_eq.alloc); rls(g_eq.queue); rls(g_eq.readback); rls(g_eq.fence);
@@ -3129,23 +3222,9 @@ static void service_pending_cleanup() {
 
 static bool g_hooked = false;
 
-// Frame generation exports the same evaluate, and hooking it wrecks the cadence.
-//
-// A frame is claimed by an unconditional swap of the DLSS jitter key, which is
-// right for as long as every evaluate reaching it belongs to the upscaler: the
-// game issues its evaluates for one frame with one jitter, so the first wins and
-// the rest do not. A DLSS-G evaluate carries no such jitter, enters with the zero
-// key, overwrites the real one and comes back "first" -- claiming a frame that
-// does not exist. At (N+1)x there are N of those per rendered frame.
-//
-// Cadence 1 survives it, because a claim only decides whether to run the network
-// and it runs on every frame anyway. Above 1 the claim decides *which* frames run
-// and which are reconstructed, so the false ones scramble the pattern and the
-// effect lands on the wrong frames -- which is why the artefact grows with both
-// the multiplier and the cadence.
-//
-// There was never anything here to hook: frame generation runs after the upscaler,
-// on an image this add-on has already been applied to. Skip it by name.
+// Avoid dedicated FG providers when gathering modules. This is only a discovery
+// filter: the shared core and sl.common also dispatch FG, so eval_dispatch must
+// enforce the feature's creation contract before inspecting Color or jitter.
 static bool is_framegen_snippet(HMODULE m) {
     wchar_t path[MAX_PATH];
     if (GetModuleFileNameW(m, path, MAX_PATH) == 0) return false;
@@ -3200,6 +3279,30 @@ static void install_hook() {
     for (unsigned i = 0; i < n; ++i) {
         auto target = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_EvaluateFeature");
         if (target == nullptr) continue;
+        // Observe the complete lifecycle at each provider before permitting NR
+        // on its evaluate path. A proxy and its core can expose different handles.
+        const auto create = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_CreateFeature");
+        const auto release = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_ReleaseFeature");
+        if (!create || !release) {
+            logf("[NRPRE] feature gate: module %u lacks lifecycle exports; leaving evaluate untouched", i);
+            continue;
+        }
+        const auto install_contract_hook = [](FARPROC address, void *hook, void **original) {
+            if (MH_CreateHook(reinterpret_cast<void *>(address), hook, original) != MH_OK)
+                return false;
+            if (MH_EnableHook(reinterpret_cast<void *>(address)) == MH_OK) return true;
+            MH_RemoveHook(reinterpret_cast<void *>(address));
+            *original = nullptr;
+            return false;
+        };
+        if (!install_contract_hook(release, reinterpret_cast<void *>(kReleaseThunks[i]),
+                                   reinterpret_cast<void **>(&g_orig_release_n[i])) ||
+            !install_contract_hook(create, reinterpret_cast<void *>(kCreateThunks[i]),
+                                   reinterpret_cast<void **>(&g_orig_create_n[i]))) {
+            logf("[NRPRE] feature gate: lifecycle hook unavailable for module %u; leaving evaluate untouched", i);
+            continue;
+        }
+        logf("[NRPRE] feature gate: CreateFeature/ReleaseFeature hooks active (module %u)", i);
         if (MH_CreateHook(reinterpret_cast<LPVOID>(target),
                           const_cast<LPVOID>(kEvalThunks[i]),
                           reinterpret_cast<LPVOID *>(&g_orig_eval_n[i])) != MH_OK) continue;
@@ -3212,18 +3315,6 @@ static void install_hook() {
     }
     if (ok == 0) { logf("[NRPRE] no NGX evaluate could be hooked"); return; }
 
-    // The create hook only reads what the game asks for, so one is enough: take
-    // it from the driver when present, otherwise from the first candidate.
-    for (unsigned i = 0; i < n; ++i) {
-        auto ctarget = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_CreateFeature");
-        if (ctarget == nullptr) continue;
-        if (MH_CreateHook(reinterpret_cast<LPVOID>(ctarget), reinterpret_cast<LPVOID>(&hk_create),
-                          reinterpret_cast<LPVOID *>(&g_orig_create)) != MH_OK) continue;
-        if (MH_EnableHook(reinterpret_cast<LPVOID>(ctarget)) == MH_OK) {
-            logf("[NRPRE] hook on NVSDK_NGX_D3D12_CreateFeature: OK (module %u)", i);
-        }
-        break;
-    }
 }
 
 // Alt-tab keeps the D3D12 device alive and only resizes the swapchain, so the
@@ -3405,7 +3496,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 #endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
         reshade::register_event<reshade::addon_event::present>(on_present);
-        logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1 -- configure in the ReShade overlay)");
+        logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1; descriptor lifetime v3; NGX feature isolation v1; visibility diagnostics v1 -- configure in the ReShade overlay)");
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);

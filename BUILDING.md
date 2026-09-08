@@ -69,9 +69,10 @@ before installing the standalone build.
 
 ## GPU validation still required
 
-Run `sh tests/run.sh` for host-side recording lifecycle regressions. These cover
-shared identity, nine pending recordings, reset/destruction, re-recording and
-repeated submissions; they do not exercise Windows COM wrappers or a GPU.
+Run `sh tests/run.sh` for host-side recording and descriptor lifecycle regressions.
+These cover shared identity, nine pending recordings, reset/destruction,
+re-recording, repeated submissions, independent queue completion and more than
+16 live descriptor owners; they do not exercise Windows COM wrappers or a GPU.
 
 Compilation and export checks do not establish game compatibility. Test:
 
@@ -93,5 +94,38 @@ Compilation and export checks do not establish game compatibility. Test:
    a stable `depthinv` in heartbeat lines. `depthsrc=fallback` means the game
    contract was unavailable and fixed reversed depth was used. Capture a fresh
    log if flicker persists; the old log cannot prove its visual cause.
+10. The follow-up Avatar log confirms flicker persists with stable depth and
+    exposure. Test the `descriptor lifetime v3` build on the same route/sky.
+    Capture `descpages`, `descbypass`, `descerr` and `erfail` from the new log:
+    allocation/passthrough and invariant counters should remain zero. Watch page
+    counts and performance through extended gameplay, resize, alt-tab and F7.
+    If the artifact remains, compare Effect strength 0, then frame generation off.
+    The log contains resource/error counters, not screenshots of corrupt pixels.
+    Follow-up: `ReShade (2).log` has zero descriptor/evaluation error counters,
+    but the user reports unchanged flicker even with Effect strength 0. The v3
+    candidate has therefore not solved the visual issue.
+11. The user confirms NR works with FG off and at 2x, and MFG 4x works with NR
+    disabled; flicker occurs with both NR and MFG 4x enabled. Test the
+    `NGX feature isolation v1` build with that combination and normal strength.
+    The log must show `feature gate: allow feature=13` (Avatar Ray Reconstruction)
+    and, when FG enters a hooked provider, `feature gate: bypass feature=11`.
+    `fg_bypass` counts rejected FG evaluations; `unknown_bypass` counts handles
+    whose creation was not observed. These counters are not GPU error counts.
+    Confirm the NR effect remains visible with F7, then check 2x, FG off and resize.
+    Unknown handles deliberately pass through: if no `allow` line appears and NR
+    has no effect, report the log; a clean image alone does not validate this fix.
+    Follow-up: `ReShade (4).log` confirms NR creation/evaluation and Color rebinds,
+    with `unknown_bypass=0`. The user confirmed the reported lack of effect was
+    caused by Effect strength remaining at zero. The overlay now identifies this
+    setting explicitly. Final confirmation of the 4x flicker fix with nonzero
+    strength remains outstanding.
+12. `visibility diagnostics v1` records `strength`, `transfer`, `enabled` and
+    `nested_dlss_bypass` in heartbeats (Diagnostics enabled). Loaded settings also
+    include intensity and rebind. First confirm Effect strength is 1 and Transfer
+    is nonzero: these are saved in ReShade.ini across binary changes. If the
+    effect is still absent, compare F7 on/off and capture the diagnostic log.
+    `nested DLSS bypass` means the non-DLSS nesting guard encountered a known
+    upscaler; zero does not prove the final displayed image contains NR. This
+    instrumentation does not change rendering or saved settings.
 
 Do not describe these binaries as game-tested until these checks run on the target GPU.

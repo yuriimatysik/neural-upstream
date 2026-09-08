@@ -26,20 +26,20 @@ jobs:
           sh proxy/build.sh
       - name: Verify Windows x64 binaries and exports
         run: |
-          for binary in neural-upstream.addon64 proxy/nvngx.dll.nr proxy/version.dll; do
+          for binary in nvngx.dll.addon64 proxy/nvngx.dll.nr proxy/version.dll; do
             x86_64-w64-mingw32-objdump -f "$binary" | grep -q 'pei-x86-64'
             x86_64-w64-mingw32-objdump -p "$binary" > "$binary.headers.txt"
           done
           grep -q nr_host_device proxy/nvngx.dll.nr.headers.txt
           grep -q nr_host_queue proxy/nvngx.dll.nr.headers.txt
           grep -q GetFileVersionInfoW proxy/version.dll.headers.txt
-          sha256sum neural-upstream.addon64 proxy/nvngx.dll.nr proxy/version.dll > SHA256SUMS
+          sha256sum nvngx.dll.addon64 proxy/nvngx.dll.nr proxy/version.dll > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: neural-upstream-windows-x64
           if-no-files-found: error
           path: |
-            neural-upstream.addon64
+            nvngx.dll.addon64
             proxy/nvngx.dll.nr
             proxy/version.dll
             SHA256SUMS

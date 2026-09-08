@@ -71,7 +71,7 @@ Choose one integration:
 
 | Integration | Files |
 | --- | --- |
-| ReShade | Rename `neural-upstream.addon64` to `nvngx.dll.addon64` beside the game executable. Requires ReShade with add-on support. |
+| ReShade | Copy `nvngx.dll.addon64` beside the game executable. Do not rename it. Requires ReShade with add-on support. |
 | Standalone | Copy **both** `proxy/version.dll` and `proxy/nvngx.dll.nr` beside the game executable. ReShade is not required. |
 
 The satellite name `nvngx.dll.nr` is significant to NGX. Do not rename it to

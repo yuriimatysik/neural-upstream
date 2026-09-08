@@ -52,6 +52,19 @@ Windows: run the same scripts in a MinGW-w64 environment with POSIX thread suppo
 and C++20, using `CXX=g++`. SDK/source revisions are pinned by the fetch script.
 No game folder is modified by building.
 
+Host regression tests require a native C++20 compiler and Python 3:
+
+```sh
+CXX=g++ sh tests/run.sh
+```
+
+The codec tests execute scalar functions extracted from the actual shader and
+check highlight retention after FP16 storage, gamut bounds, shadow guards and
+detail/lighting invariants. To also compile all seven HLSL entry points with an
+installed Microsoft DXC, set `DXC=/path/to/dxc` on that command. This checks SM6
+syntax; the add-on still compiles `cs_5_0` through `d3dcompiler_47.dll` at runtime.
+Neither host test replaces Windows/GPU validation or measures visual quality.
+
 ## Outputs
 
 Choose one integration:

@@ -158,6 +158,9 @@ static bool g_diagnostics = false;
 // overlay and F7; re-reading the INI on every callback silently undid either
 // action a moment later.
 static bool g_enabled_setting_loaded = false;
+#ifndef NR_STANDALONE
+static reshade::api::effect_runtime *g_effect_runtime = nullptr;
+#endif
 
 // ReShade 6.8 exposes its underlying COM object through this optional IID.
 // Older versions and native objects fall back to the original interface.
@@ -432,6 +435,11 @@ static float g_paper_white = 1.0f;     // neutral: scene-linear 1.0 = reference 
 static float g_transfer = 1.0f;
 static float g_color_strength = 1.0f;   // shader reads 0 as 1.0, so this is identical
 static unsigned g_hdr_mode = 2;        // 2 = scene-linear; auto-guides may drop it to 0
+static int g_encode_curve = 1;        // gradual shoulder; legacy remains available for A/B
+static float g_detail_strength = 1.0f;
+static float g_lighting_strength = 1.0f;
+static bool g_codec_settings_dirty = false;
+static constexpr UINT kCodecConstants = 20;
 static float g_knee = 0.75f;           // shoulder start of the development curve
 
 // Live status shown in the overlay.
@@ -926,7 +934,7 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     rp[0].DescriptorTable.pDescriptorRanges = ranges;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = 16;
+    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = kCodecConstants;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsd{};
@@ -1044,7 +1052,15 @@ static NVSDK_NGX_Handle *g_nr_handle_hi = nullptr;
 static ID3D12Resource   *g_nr_out_hi = nullptr;
 static NVSDK_NGX_Parameter *g_nr_params_hi = nullptr;
 static bool              g_use_hi = false;        // F8
-static int               g_repeat = 1;            // F9: run NR N times per frame
+static int               g_repeat = 1;            // how many times the network is applied
+// Chained passes stage each result into this buffer and the next pass reads the
+// copy. A texture cannot read and write itself at once, and the network's
+// D3D12 backend did not tolerate a buffer it had just written being handed
+// back as an input in the same frame (E_INVALIDARG on the first multi-pass
+// frame), so the copy is what makes the chain safe: the network's output stays
+// 'out' on every pass, and 'stage' is only ever an input.
+static ID3D12Resource   *g_nr_stage = nullptr;
+static ID3D12Resource   *g_nr_stage_hi = nullptr;
 static bool              g_rebind = true;         // F10: feed NR output into DLSS (visible)
 // Every frame is the default: since the cadence anchors on the jitter, this is one
 // NR pass per frame in the pass that is actually shown. The old evaluate counter ran
@@ -1365,7 +1381,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             logf("[NRPRE] HB #%llu handle=%p | pw=%.4f meas=%.4f valid=%d upd=%u "
                  "| hdr=%u det=%d knee=%.3f kmeas=%.3f | expfresh=%u fromgame=%d "
                  "| net=%ux%u finalvalid=%d | enabled=%d strength=%.3f transfer=%.3f "
-                 "| cad=%d async=%d | erfail=%u grfail=%u passthru=%u "
+                 "| curve=%d detail=%.3f lighting=%.3f | cad=%d rep=%d async=%d | erfail=%u grfail=%u passthru=%u "
                  "| depthinv=%d depthsrc=%s | descpages=%zu descbypass=%u descerr=%u "
                  "| fg_bypass=%llu unknown_bypass=%llu nested_dlss_bypass=%llu",
                  (unsigned long long)hb, (void *)g_nr_handle,
@@ -1374,7 +1390,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                  g_exp_fresh, (int)g_exp_from_game,
                  g_net_w, g_net_h, (int)g_final_valid,
                  (int)g_controls.enabled, g_controls.effect_strength, g_transfer,
-                 g_skip_n, (int)g_async_net,   // which mode was actually running, always
+                 g_encode_curve, g_detail_strength, g_lighting_strength,
+                 g_skip_n, (int)g_repeat, (int)g_async_net,   // which mode was actually running, always
                  g_er_fail, g_gr_fail, g_pass_frames,
                  (int)g_depth_reversed, g_depth_from_game ? "game" : "fallback",
                  g_descriptor_pages.size(), g_descriptor_bypass, g_descriptor_invariant,
@@ -1495,6 +1512,11 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     net_mv    = g_cx.snap_mv;
                 }
             }
+            const bool codec_refresh = use_codec && g_codec_settings_dirty;
+            if (codec_refresh) {
+                g_final_valid = g_delta_valid = false;
+                g_reset_pending = true; // old NR history belongs to a different codec
+            }
             pset_res(pp, "DLSSNR.Color",  net_color);
             pset_res(pp, "DLSSNR.Depth",  net_depth);
             pset_res(pp, "DLSSNR.MVec",   net_mv);
@@ -1579,9 +1601,9 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // One NR pass per selected frame: the frame's other evaluate reuses the
             // result. Skipped frames keep showing the last one, which is what makes
             // a lower cadence visible at all.
-            const bool run_now = first_of_frame
+            const bool run_now = codec_refresh || (first_of_frame
                               && ((g_skip_n <= 1)
-                                  || (((frame + g_phase) % (unsigned)g_skip_n) == 0));
+                                  || (((frame + g_phase) % (unsigned)g_skip_n) == 0)));
             if (g_jit_burst > 0) {
                 --g_jit_burst;
                 float jx = 0.0f, jy = 0.0f;
@@ -1606,6 +1628,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            const D3D12_RESOURCE_STATES kCS  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            const D3D12_RESOURCE_STATES kCD  = D3D12_RESOURCE_STATE_COPY_DEST;
 
             g_net_w = w_net; g_net_h = h_net;
 
@@ -1630,20 +1654,40 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                    g_cx.proxy, w_net, h_net);
                     uav_barrier(cmd, g_cx.proxy);
                     barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);   // NGX reads inputs as SRV
-                    pset_res(pp, "DLSSNR.Color", g_cx.proxy);
-                } else {
-                    pset_res(pp, "DLSSNR.Color", in);
                 }
 
-                // The braces are load-bearing: without them the loop covered only the
-                // first mark and the evaluate ran once regardless of g_repeat.
+                // Passes are chained, not repeated: each pass reads the previous
+                // pass's result, so the effect compounds instead of re-running the
+                // same input N times. The result is copied to 'stage' between
+                // passes: a texture cannot be its own input and output at once, and
+                // handing the network a buffer it just wrote in the same frame is
+                // what broke the D3D12 backend, so 'stage' is only ever an input
+                // and the network's output stays 'out' on every pass.
+                ID3D12Resource *stage = hi ? g_nr_stage_hi : g_nr_stage;
+                if (stage == nullptr) g_repeat = 1;
+                ID3D12Resource *cur_in = use_codec ? g_cx.proxy : in;
+                bool staged = false;
                 for (int k = 0; k < g_repeat; ++k) {
+                    pset_res(pp, "DLSSNR.Color",  cur_in);
+                    pset_res(pp, "DLSSNR.Output", out);
                     prof_mark(cmd, 1);
                     er = (hi ? g_snip_eval : g_nr_eval)(cmd, hh, pp, nullptr);
                     uav_barrier(cmd, out);
                     prof_mark(cmd, 2);
                     if (er != NVSDK_NGX_Result_Success) break;
+                    if (k + 1 < g_repeat) {
+                        barrier_transition(cmd, out,   kUAV, kCS);
+                        barrier_transition(cmd, stage, staged ? kSRV : kUAV, kCD);
+                        cmd->CopyResource(stage, out);
+                        barrier_transition(cmd, out,   kCS, kUAV);
+                        barrier_transition(cmd, stage, kCD, kSRV);
+                        cur_in = stage;
+                        staged = true;
+                    }
                 }
+                // After a staged pass the stage buffer sits in SRV (it was the
+                // last input); park it in UAV so the next frame can stage into it.
+                if (staged) barrier_transition(cmd, stage, kSRV, kUAV);
                 if (g_async_net && g_cx.snap_ready) {
                     // back to UAV so the next frame's snapshot can write them again
                     barrier_transition(cmd, g_cx.snap_color,
@@ -1666,6 +1710,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 }
 
                 if (use_codec && er == NVSDK_NGX_Result_Success) {
+                    g_codec_settings_dirty = false;
                     barrier_transition(cmd, out, kUAV, kSRV);          // decode reads NR output
                     // Uniform mode: this frame is developed from the delta that is
                     // already stored, exactly as the frames between are, so no frame
@@ -2147,6 +2192,9 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         g_nr_out = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
     if (!g_nr_out) { logf("[NRPRE] NR output allocation failed"); return; }
     pset_res(g_nr_params, "DLSSNR.Output", g_nr_out);
+    if (!g_nr_stage)
+        g_nr_stage = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (!g_nr_stage) logf("[NRPRE] NR staging buffer allocation failed; chained passes limited to one");
     g_setup_w = w; g_setup_h = h;
 
     auto core_eval = reinterpret_cast<PFN_Eval>(GetProcAddress(core, "NVSDK_NGX_D3D12_EvaluateFeature"));
@@ -2260,6 +2308,8 @@ static void build_hi(ID3D12GraphicsCommandList *cmd) {
             g_nr_out_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
             if (!g_nr_out_hi) return;
             pset_res(g_nr_params_hi, "DLSSNR.Output", g_nr_out_hi);
+            g_nr_stage_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (!g_nr_stage_hi) logf("[NRPRE] HI staging buffer allocation failed; chained passes limited to one");
             pset_u(g_nr_params_hi, "DLSSNR.InputWidth", g_out_w);
             pset_u(g_nr_params_hi, "DLSSNR.InputHeight", g_out_h);
             pset_u(g_nr_params_hi, "DLSSNR.OutputWidth", g_out_w);
@@ -2361,21 +2411,24 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     if (pw_effective < 0.10f) pw_effective = 0.10f;
     if (pw_effective > 4.00f) pw_effective = 4.00f;
     struct { UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
-             float mvx, mvy, reproj, dreject, sgate, strength, chroma, pad4; } k{
+             float mvx, mvy, reproj, dreject, sgate, strength, chroma; UINT curve;
+             float detail, lighting, padding[2]; } k{
         w, h, pw_effective, g_transfer, g_color_strength, hdr_mode, g_knee, g_delta_clamp,
         g_mv_scale_x, g_mv_scale_y,
         // advected: it is already in place, so do not move it again
         (g_delta_advect && g_cx.pso_advect) ? 0.0f
             : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
         g_depth_reject, g_struct_gate,
-        g_controls.effect_strength, g_chroma_transfer, 0.0f };
+        g_controls.effect_strength, g_chroma_transfer, (UINT)g_encode_curve,
+        g_detail_strength, g_lighting_strength, {0.0f, 0.0f} };
+    static_assert(sizeof(k) == kCodecConstants * sizeof(UINT));
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g_cx.root);
     cmd->SetPipelineState(pso);
     cmd->SetComputeRootDescriptorTable(0, gpu);
-    cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
+    cmd->SetComputeRoot32BitConstants(1, kCodecConstants, &k, 0);
     cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
 }
 
@@ -2430,13 +2483,13 @@ static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     D3D12_CPU_DESCRIPTOR_HANDLE uh1 = cpu; uh1.ptr += (SIZE_T)6 * g_cx.inc;
     dev->CreateUnorderedAccessView(dstTex, nullptr, &ud, uh1);
 
-    struct { UINT w, h; float f[14]; } k{}; k.w = w; k.h = h;
+    struct { UINT w, h; float f[kCodecConstants - 2]; } k{}; k.w = w; k.h = h;
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g_cx.root);
     cmd->SetPipelineState(g_cx.pso_snap);
     cmd->SetComputeRootDescriptorTable(0, gpu);
-    cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
+    cmd->SetComputeRoot32BitConstants(1, kCodecConstants, &k, 0);
     cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
 }
 
@@ -2474,6 +2527,11 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 // ReShade keeps one ReShade.ini per game, so this is per-game config for free.
 static void load_settings(reshade::api::effect_runtime *rt) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+#ifndef NR_STANDALONE
+    g_effect_runtime = rt;
+#endif
+    const int old_curve = g_encode_curve;
+    const float old_detail = g_detail_strength, old_lighting = g_lighting_strength;
     int v = 0; float f = 0.0f;
     if (!g_enabled_setting_loaded) {
         if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))
@@ -2516,7 +2574,16 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Transfer", f)) g_transfer = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Saturation", f)) g_color_strength = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_controls.effect_strength = f;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v)) g_repeat = (v < 1 ? 1 : (v > 4 ? 4 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoPaperWhite", v)) g_auto_pw = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "EncodeCurve", v))
+        g_encode_curve = (v == 0 ? 0 : 1);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "DetailStrength", f))
+        g_detail_strength = std::isfinite(f) ? std::clamp(f, 0.0f, 2.0f) : 1.0f;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "LightingStrength", f))
+        g_lighting_strength = std::isfinite(f) ? std::clamp(f, 0.0f, 1.5f) : 1.0f;
+    if (old_curve != g_encode_curve || old_detail != g_detail_strength || old_lighting != g_lighting_strength)
+        g_codec_settings_dirty = true;
     if (g_controls.ensure_visible_strength()) {
         logf("[NRPRE] settings repair: enabled NR had zero EffectStrength; restored to 1.0");
         reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength",
@@ -2524,10 +2591,17 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     }
     if (g_auto_pw && g_pw_valid) return;   // already converged, keep it
     logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f "
-         "strength=%.3f transfer=%.3f intensity=%.3f rebind=%d",
+         "strength=%.3f transfer=%.3f intensity=%.3f rebind=%d curve=%d detail=%.3f lighting=%.3f",
          (int)g_controls.enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee,
-         g_controls.effect_strength, g_transfer, g_intensity, (int)g_rebind);
+         g_controls.effect_strength, g_transfer, g_intensity, (int)g_rebind,
+         g_encode_curve, g_detail_strength, g_lighting_strength);
 }
+#ifndef NR_STANDALONE
+static void on_destroy_effect_runtime(reshade::api::effect_runtime *rt) {
+    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    if (g_effect_runtime == rt) g_effect_runtime = nullptr;
+}
+#endif
 // Paper white shifts what the network is shown, so a preset nudges it rather than
 // setting it: auto exposure owns the absolute value, this only biases it.
 static void apply_preset(int p) {
@@ -2551,6 +2625,9 @@ static void apply_preset(int p) {
 }
 
 static void save_settings(reshade::api::effect_runtime *rt) {
+    reshade::set_config_value(rt, "NRPreUpscale", "EncodeCurve", g_encode_curve);
+    reshade::set_config_value(rt, "NRPreUpscale", "DetailStrength", g_detail_strength);
+    reshade::set_config_value(rt, "NRPreUpscale", "LightingStrength", g_lighting_strength);
     reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_controls.enabled ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
     reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
@@ -2571,6 +2648,7 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Transfer", g_transfer);
     reshade::set_config_value(rt, "NRPreUpscale", "Saturation", g_color_strength);
     reshade::set_config_value(rt, "NRPreUpscale", "EffectStrength", g_controls.effect_strength);
+    reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_repeat);
     reshade::set_config_value(rt, "NRPreUpscale", "Codec", g_codec_on ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "AutoMask", g_auto_mask ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "PaperWhite", g_paper_white);
@@ -2585,6 +2663,9 @@ static void save_settings(reshade::api::effect_runtime *rt) {
 #ifndef NR_STANDALONE
 static void draw_overlay(reshade::api::effect_runtime *rt) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
+    const int old_curve = g_encode_curve;
+    const int old_repeat = g_repeat;
+    const float old_detail = g_detail_strength, old_lighting = g_lighting_strength;
     bool changed = false;
 
     bool enabled = g_controls.enabled;
@@ -2654,6 +2735,19 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     default: ImGui::TextDisabled("Set by hand in Advanced."); break;
     }
 
+    ImGui::BeginDisabled(!g_codec_on);
+    const char *curves[] = { "Legacy", "Preserve highlights" };
+    changed |= ImGui::Combo("Highlight curve", &g_encode_curve, curves, 2);
+    ImGui::SetItemTooltip("Preserve highlights gives the network more contrast in bright areas. "
+                          "Legacy restores the previous curve for comparison.");
+    changed |= ImGui::SliderFloat("Detail strength", &g_detail_strength, 0.0f, 2.0f, "%.2f");
+    ImGui::SetItemTooltip("Adjusts fine variations in the network's luminance gain. "
+                          "1 is unchanged; try 1.15 for a modest boost. Extra contrast is limited.");
+    changed |= ImGui::SliderFloat("Lighting strength", &g_lighting_strength, 0.0f, 1.5f, "%.2f");
+    ImGui::SetItemTooltip("Adjusts the smooth component of the network's luminance gain. "
+                          "1 keeps its lighting. Both controls at 1 use the original transfer.");
+    ImGui::EndDisabled();
+
     ImGui::TextDisabled("How much of it is kept");
     changed |= ImGui::SliderFloat("Effect strength", &g_controls.effect_strength, 0.05f, 2.0f, "%.2f");
     ImGui::SetItemTooltip("How far to carry the network's result. 1 is the full effect, and "
@@ -2662,6 +2756,12 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                            "dilutes everything evenly; the setting above shapes what the "
                            "network does instead.");
 
+    changed |= ImGui::SliderInt("Network passes", &g_repeat, 1, 4, "%d");
+    ImGui::SetItemTooltip("How many times the network is applied to the image in one frame. "
+                          "Each pass re-runs the network on the previous pass's result, so the "
+                          "effect compounds: 2 is roughly the network pushing itself twice as "
+                          "far. Each extra pass costs a full run of the network (~3.3 ms at "
+                          "1280x720), so at 4 the frame budget roughly quadruples. F9 cycles it.");
 
     ImGui::Spacing();
     ImGui::SeparatorText("Exposure");
@@ -2712,8 +2812,8 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                               "detected and passed through on its own, so turning this off is "
                               "a diagnostic, not a setting.");
         changed |= ImGui::SliderFloat("Transfer", &g_transfer, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("How much of the development curve to apply before the network "
-                              "sees the image. 1 is the full curve.");
+        ImGui::SetItemTooltip("How much of the network's restored result to apply. "
+                              "1 keeps the full transfer; 0 keeps the original colour.");
         changed |= ImGui::SliderFloat("Saturation", &g_color_strength, 0.0f, 1.5f, "%.2f");
         ImGui::SetItemTooltip("1 keeps the colour as developed. Below 1 desaturates toward "
                               "luminance, above 1 pushes it further.");
@@ -2818,6 +2918,10 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         g_auto_mask = true;
         g_paper_white = 1.0f;
         g_knee = 0.75f;
+        g_encode_curve = 1;
+        g_detail_strength = 1.0f;
+        g_lighting_strength = 1.0f;
+        g_repeat = 1;
         g_skin_structure = -1.0f;
         g_local_structure = 0.70f;
         g_local_tone = 0.15f;
@@ -2830,6 +2934,15 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::SameLine();
     ImGui::TextDisabled("Saved per game in ReShade.ini");
 
+    if (old_curve != g_encode_curve || old_detail != g_detail_strength || old_lighting != g_lighting_strength) {
+        g_codec_settings_dirty = true;
+        logf("[NRPRE] codec tuning: curve=%d detail=%.3f lighting=%.3f (history reset pending)",
+             g_encode_curve, g_detail_strength, g_lighting_strength);
+    }
+    if (old_repeat != g_repeat) {
+        reset_temporal_history();
+        logf("[NRPRE] UI: network passes -> %d; temporal history cleared", g_repeat);
+    }
     if (changed) save_settings(rt);
 }
 #endif  // NR_STANDALONE
@@ -3250,7 +3363,7 @@ static void service_pending_cleanup() {
     g_nr_handle = g_nr_handle_hi = nullptr;
 
     auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
-    rls(g_nr_out); rls(g_nr_out_hi);
+    rls(g_nr_out); rls(g_nr_stage); rls(g_nr_out_hi); rls(g_nr_stage_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     for (auto &page : g_descriptor_pages) rls(page.heap);
     g_descriptor_pages.clear();
@@ -3540,6 +3653,20 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     }
     ph_prev = ph_down;
 
+    static bool rp_prev = false;
+    const bool rp_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (rp_down && !rp_prev) {
+        g_repeat = (g_repeat >= 4) ? 1 : g_repeat + 1;
+        reset_temporal_history();
+#ifndef NR_STANDALONE
+        if (g_effect_runtime != nullptr)
+            reshade::set_config_value(g_effect_runtime, "NRPreUpscale", "Passes", g_repeat);
+#endif
+        logf("[NRPRE] F9: network passes -> %d; temporal history cleared", g_repeat);
+        g_jit_burst = 40;
+    }
+    rp_prev = rp_down;
+
     // Keep controls alive while old GPU work drains. Previously this return sat
     // above all hotkeys, so one never-submitted list made F7 appear dead forever.
     static unsigned pending_report = 0;
@@ -3595,8 +3722,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_overlay("NR Pre-Upscale", draw_overlay);
 #endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::present>(on_present);
-        logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1; descriptor lifetime v3; NGX feature isolation v1; visibility diagnostics v1 -- configure in the ReShade overlay)");
+        logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1; descriptor lifetime v3; NGX feature isolation v1; visibility diagnostics v1; highlight codec v2 -- configure in the ReShade overlay)");
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
@@ -3604,6 +3732,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(load_settings);
+        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::unregister_event<reshade::addon_event::present>(on_present);
         reshade::unregister_addon(hModule);
         break;

@@ -4,7 +4,8 @@
 
 This fork combines the Stellar Blade fixes from upstream issue #3, the
 community-runtime fixes in PR #4, Leonardo Capellaro's stability and frame
-generation work, and additional recovery fixes for the in-game controls.
+generation work, his v0.5.0 multi-pass and highlight changes, and additional
+recovery fixes for the in-game controls.
 
 ### Bug fixes
 
@@ -27,6 +28,8 @@ generation work, and additional recovery fixes for the in-game controls.
   logging opt-in, under **Developer diagnostics** in the overlay.
 - **Early NGX hook failure:** retry until a complete lifecycle/evaluate hook set
   succeeds and remove partial hooks before retrying.
+- **Multi-pass device removal:** copy each NR result into a dedicated staging
+  texture before feeding it into another network pass.
 
 It also includes the earlier resource-dimension and typed-view corrections,
 explicit NR input/output geometry, scratch-buffer fallback, safe resource
@@ -42,7 +45,7 @@ Leonardo reports no flicker in his fork when testing:
 - Avatar: Frontiers of Pandora
 
 For frame generation, use the **Quality** cadence described below. The current
-Dawnwalker candidate still needs extended in-game validation.
+Dawnwalker candidate and MFG behavior still need extended in-game validation.
 
 ### Thanks and credits
 
@@ -56,7 +59,8 @@ contributed testing and bug reports through
 Special thanks to **Leonardo Capellaro** for the
 [stability and frame-generation fixes](https://github.com/leonardocapellaro/neural-upstream).
 His submission tracking, feature isolation, descriptor lifetime and depth-guide
-work are incorporated into this fork.
+work, plus the multi-pass staging and highlight/detail controls, are incorporated
+into this fork.
 
 See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
 builds, installation and detailed validation notes.
@@ -89,9 +93,33 @@ afterwards. The restore reads the network's contribution as a per-pixel
 luminance gain and applies it to the original, which keeps the full HDR range and
 leaves hue and saturation exactly as the game rendered them.
 
-Reference white for that normalisation is read from the game's own exposure
-buffer on a dedicated copy queue, so it tracks day and night without a fixed
-value tuned by hand.
+Reference white is estimated from a scene histogram. Direct copying of the
+game's exposure texture is disabled because its resource state cannot be proven
+safe from an NGX hook.
+
+**Highlight and detail controls.** `Highlight curve` defaults to **Preserve
+highlights**: a gradual shoulder retains more differences between bright values
+in the FP16 network input, with gamut compression to keep saturated colours in
+range. **Legacy** selects the previous exponential shoulder and colour handling.
+This changes what the network sees; visual improvement still needs comparison
+in each game.
+
+`Detail strength` adjusts fine variations in the network's luminance gain;
+`Lighting strength` adjusts its locally averaged component. Both default to
+**1.00**, which uses the original gain transfer without neighbourhood filtering.
+Non-default values use an edge-weighted five-tap estimate; extra detail gain is
+limited to a quarter stop and the overall gain remains within 1/8 to 8. This is
+a local approximation of lighting versus detail, not a semantic separation.
+Both direct and reused-frame decode apply the same adjustment. Its GPU cost
+has not yet been measured.
+
+For comparison, keep cadence **Quality**, one network pass, and effect/transfer
+at **1.00**. First compare the two curves with detail and lighting at **1.00**;
+then try detail **1.15**, keeping lighting at **1.00**. Compare a stationary scene
+and camera motion, including bright textures, foliage and skin. Changing these
+controls resets NR history and cached output; allow it to settle before comparing.
+Settings persist as `EncodeCurve` (0 legacy, 1 preserve highlights),
+`DetailStrength` (0–2) and `LightingStrength` (0–1.5) in `[NRPreUpscale]`.
 
 **Cadence.** The network can run less often than every frame. The choice of which
 frame is anchored to the DLSS jitter rather than to a count of calls, because the
@@ -139,8 +167,7 @@ Then `./build.sh`. Needs a MinGW-w64 g++ with C++20.
 
 ## Installing
 
-The build script writes `neural-upstream.addon64`. Copy it to the game folder as
-`nvngx.dll.addon64`.
+The build script writes `nvngx.dll.addon64`. Copy it to the game folder.
 
 **The filename matters.** The NGX snippet gates feature creation on the calling
 module's path containing `nvngx.dll`; under any other name it returns
@@ -153,7 +180,7 @@ Everything is configured from the ReShade overlay.
 back on. `F6` switches Effect strength between normal (`1`) and an exaggerated
 diagnostic value (`3`); it no longer makes an enabled effect invisible. Old
 saved configurations with enabled NR and zero Effect strength are repaired to
-`1` when loaded.
+`1` when loaded. `F9` cycles one through four network passes.
 
 ## Where the time goes
 
@@ -167,8 +194,8 @@ measured rather than guessed. On an RTX 4070 Ti at 1280x720 render resolution:
 | colour decode | 0.017 ms |
 
 The network is 99% of it, and about a third of a 100 fps frame. The colour
-pipeline is free by comparison, so there is nothing worth optimising on this
-side — cadence is the only lever that moves the number.
+pipeline is small by comparison at the original transfer settings. These timings
+predate the optional neighbourhood detail adjustment; measure its cost separately.
 
 ## Status
 

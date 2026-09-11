@@ -27,15 +27,6 @@ int main() {
     require(disabled.changed && !disabled.reset_history,
             "turning NR off does not request a history reset");
 
-    state.effect_strength = 1.0f;
-    state.cycle_diagnostic_strength();
-    require(state.effect_strength == 3.0f, "F6 can exaggerate a visible effect");
-    state.cycle_diagnostic_strength();
-    require(state.effect_strength == 1.0f, "F6 returns to normal without disabling visibility");
-    state.effect_strength = 0.0f;
-    state.cycle_diagnostic_strength();
-    require(state.effect_strength == 1.0f, "F6 recovers a previously saved zero strength");
-
     state.enabled = true;
     state.effect_strength = 0.0f;
     require(state.ensure_visible_strength() && state.effect_strength == 1.0f,

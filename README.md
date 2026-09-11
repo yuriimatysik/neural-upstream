@@ -22,8 +22,8 @@ recovery fixes for the in-game controls.
   convention instead of a changing screen sample, reset temporal history when
   that convention changes, and recover when jitter stops advancing.
 - **Enabled NR remaining invisible:** repair old configurations that saved
-  `EffectStrength=0`, keep F6 on a visible `1`/`3` diagnostic cycle, and reset
-  temporal history when F7 or the overlay turns NR back on.
+  `EffectStrength=0`, and reset temporal history when F7 or the overlay turns NR
+  back on.
 - **Gameplay hitches from diagnostics:** keep GPU timestamp readback and verbose
   logging opt-in, under **Developer diagnostics** in the overlay.
 - **Early NGX hook failure:** retry until a complete lifecycle/evaluate hook set
@@ -176,11 +176,11 @@ module's path containing `nvngx.dll`; under any other name it returns
 Needs ReShade with add-on support, and `nvngx_dlssnr.dll` in the game folder.
 Everything is configured from the ReShade overlay.
 
-`F7` toggles Neural Rendering and clears its temporal history when turning it
-back on. `F6` switches Effect strength between normal (`1`) and an exaggerated
-diagnostic value (`3`); it no longer makes an enabled effect invisible. Old
-saved configurations with enabled NR and zero Effect strength are repaired to
-`1` when loaded. `F9` cycles one through four network passes.
+`F7` is the only Neural Rendering toggle and clears temporal history when turning
+it back on. A short debounce prevents one key press from toggling twice. Network
+passes are locked to one because repeated passes compound the effect, darken the
+image and can make highlights look artificial. Old `Passes` values are repaired
+to `1` when loaded. `F6` and `F9` no longer change NR state.
 
 ## Where the time goes
 

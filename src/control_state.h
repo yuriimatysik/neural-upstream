@@ -29,12 +29,6 @@ public:
         return result;
     }
 
-    void cycle_diagnostic_strength() {
-        effect_strength = effect_strength > 2.0f ? 1.0f
-                        : effect_strength < 0.01f ? 1.0f
-                                                  : 3.0f;
-    }
-
     bool ensure_visible_strength() {
         if (!enabled || effect_strength > 0.01f) return false;
         effect_strength = 1.0f;

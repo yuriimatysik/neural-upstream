@@ -171,9 +171,6 @@ static bool g_diagnostics = false;
 // overlay and F7; re-reading the INI on every callback silently undid either
 // action a moment later.
 static bool g_enabled_setting_loaded = false;
-#ifndef NR_STANDALONE
-static reshade::api::effect_runtime *g_effect_runtime = nullptr;
-#endif
 
 // ReShade 6.8 exposes its underlying COM object through this optional IID.
 // Older versions and native objects fall back to the original interface.
@@ -1087,7 +1084,7 @@ static NVSDK_NGX_Handle *g_nr_handle_hi = nullptr;
 static ID3D12Resource   *g_nr_out_hi = nullptr;
 static NVSDK_NGX_Parameter *g_nr_params_hi = nullptr;
 static bool              g_use_hi = false;        // F8
-static int               g_repeat = 1;            // how many times the network is applied
+static constexpr int     g_repeat = 1;            // repeated NR compounds the image
 // Chained passes stage each result into this buffer and the next pass reads the
 // copy. A texture cannot read and write itself at once, and the network's
 // D3D12 backend did not tolerate a buffer it had just written being handed
@@ -1810,7 +1807,6 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 // what broke the D3D12 backend, so 'stage' is only ever an input
                 // and the network's output stays 'out' on every pass.
                 ID3D12Resource *stage = hi ? g_nr_stage_hi : g_nr_stage;
-                if (stage == nullptr) g_repeat = 1;
                 ID3D12Resource *cur_in = use_codec ? g_cx.proxy : in;
                 bool staged = false;
                 for (int k = 0; k < g_repeat; ++k) {
@@ -2680,9 +2676,6 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 // ReShade keeps one ReShade.ini per game, so this is per-game config for free.
 static void load_settings(reshade::api::effect_runtime *rt) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
-#ifndef NR_STANDALONE
-    g_effect_runtime = rt;
-#endif
     const int old_curve = g_encode_curve;
     const float old_detail = g_detail_strength, old_lighting = g_lighting_strength;
     int v = 0; float f = 0.0f;
@@ -2727,7 +2720,8 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Transfer", f)) g_transfer = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Saturation", f)) g_color_strength = f;
     if (reshade::get_config_value(rt, "NRPreUpscale", "EffectStrength", f)) g_controls.effect_strength = f;
-    if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v)) g_repeat = (v < 1 ? 1 : (v > 4 ? 4 : v));
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v) && v != g_repeat)
+        reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_repeat);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoPaperWhite", v)) g_auto_pw = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "EncodeCurve", v))
         g_encode_curve = (v == 0 ? 0 : 1);
@@ -2749,12 +2743,6 @@ static void load_settings(reshade::api::effect_runtime *rt) {
          g_controls.effect_strength, g_transfer, g_intensity, (int)g_rebind,
          g_encode_curve, g_detail_strength, g_lighting_strength);
 }
-#ifndef NR_STANDALONE
-static void on_destroy_effect_runtime(reshade::api::effect_runtime *rt) {
-    std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
-    if (g_effect_runtime == rt) g_effect_runtime = nullptr;
-}
-#endif
 // Paper white shifts what the network is shown, so a preset nudges it rather than
 // setting it: auto exposure owns the absolute value, this only biases it.
 static void apply_preset(int p) {
@@ -2817,7 +2805,6 @@ static void save_settings(reshade::api::effect_runtime *rt) {
 static void draw_overlay(reshade::api::effect_runtime *rt) {
     std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
     const int old_curve = g_encode_curve;
-    const int old_repeat = g_repeat;
     const float old_detail = g_detail_strength, old_lighting = g_lighting_strength;
     bool changed = false;
 
@@ -2912,12 +2899,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                            "dilutes everything evenly; the setting above shapes what the "
                            "network does instead.");
 
-    changed |= ImGui::SliderInt("Network passes", &g_repeat, 1, 4, "%d");
-    ImGui::SetItemTooltip("How many times the network is applied to the image in one frame. "
-                          "Each pass re-runs the network on the previous pass's result, so the "
-                          "effect compounds: 2 is roughly the network pushing itself twice as "
-                          "far. Each extra pass costs a full run of the network (~3.3 ms at "
-                          "1280x720), so at 4 the frame budget roughly quadruples. F9 cycles it.");
+    ImGui::TextDisabled("Network passes: 1 (locked for stability)");
 
     ImGui::Spacing();
     ImGui::SeparatorText("Exposure");
@@ -3077,7 +3059,6 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         g_encode_curve = 1;
         g_detail_strength = 1.0f;
         g_lighting_strength = 1.0f;
-        g_repeat = 1;
         g_skin_structure = -1.0f;
         g_local_structure = 0.70f;
         g_local_tone = 0.15f;
@@ -3094,10 +3075,6 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         g_codec_settings_dirty = true;
         logf("[NRPRE] codec tuning: curve=%d detail=%.3f lighting=%.3f (history reset pending)",
              g_encode_curve, g_detail_strength, g_lighting_strength);
-    }
-    if (old_repeat != g_repeat) {
-        reset_temporal_history();
-        logf("[NRPRE] UI: network passes -> %d; temporal history cleared", g_repeat);
     }
     if (changed) save_settings(rt);
 }
@@ -3742,32 +3719,19 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         install_submission_hook(reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()));
     service_pending_cleanup();
     static bool prev_down = false;
+    static ULONGLONG last_toggle_tick = 0;
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (down && !prev_down)
-        set_nr_enabled(!g_controls.enabled, "F7");
+    if (down && !prev_down) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - last_toggle_tick >= 250) {
+            set_nr_enabled(!g_controls.enabled, "F7");
+            last_toggle_tick = now;
+        }
+    }
     prev_down = down;
 
     // F10 stamps the log so a visual event can be located exactly: the breakage
     // leaves no DXGI or state trace, so the timestamp has to come from the user.
-    // F6 switches between normal and exaggerated strength. It deliberately never
-    // stores zero: F7 owns ON/OFF, so the two controls cannot contradict each other.
-    //
-    // Without an overlay there is no way to see whether the network is doing
-    // anything, and "is it on?" is not a question a subtle effect can answer. The
-    // strength is a blend factor toward the network's result, so pushing it past 1
-    // extrapolates and turns a subtle change into an obvious one. If 3.0 looks
-    // wrong in an obvious way, the whole pipeline is alive; if it looks identical,
-    // nothing is reaching the screen and the strength is not the problem.
-    static bool ex_prev = false;
-    const bool ex_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-    if (ex_down && !ex_prev) {
-        g_controls.cycle_diagnostic_strength();
-        logf("[NRPRE] F6: EffectStrength = %.1f  (%s)", g_controls.effect_strength,
-             g_controls.effect_strength > 2.0f
-                 ? "EXAGERADO -- si no se nota, no llega a pantalla"
-                 : "normal");
-    }
-    ex_prev = ex_down;
 
     static bool mark_prev = false;
     const bool mark_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -3813,20 +3777,6 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         g_jit_burst = 40;
     }
     ph_prev = ph_down;
-
-    static bool rp_prev = false;
-    const bool rp_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (rp_down && !rp_prev) {
-        g_repeat = (g_repeat >= 4) ? 1 : g_repeat + 1;
-        reset_temporal_history();
-#ifndef NR_STANDALONE
-        if (g_effect_runtime != nullptr)
-            reshade::set_config_value(g_effect_runtime, "NRPreUpscale", "Passes", g_repeat);
-#endif
-        logf("[NRPRE] F9: network passes -> %d; temporal history cleared", g_repeat);
-        g_jit_burst = 40;
-    }
-    rp_prev = rp_down;
 
     // Keep controls alive while old GPU work drains. Previously this return sat
     // above all hotkeys, so one never-submitted list made F7 appear dead forever.
@@ -3883,7 +3833,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_overlay("NR Pre-Upscale", draw_overlay);
 #endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
-        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::present>(on_present);
         logf("[NRPRE] addon registered (submission tracking v2; stable depth guides v1; descriptor lifetime v3; NGX feature isolation v1; visibility diagnostics v1; highlight codec v2 -- configure in the ReShade overlay)");
         break;
@@ -3893,7 +3842,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(load_settings);
-        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::unregister_event<reshade::addon_event::present>(on_present);
         reshade::unregister_addon(hModule);
         break;

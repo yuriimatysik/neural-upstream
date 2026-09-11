@@ -21,6 +21,7 @@
 #include "descriptor_lifetime.h"
 #include "feature_registry.h"
 #include "control_state.h"
+#include "guide_metadata.h"
 #include <atomic>
 #include <new>
 #include <vector>
@@ -475,6 +476,8 @@ static bool  g_hdr_detected = true;    // latched: proven HDR, never unlatched
 static unsigned g_hdr_samples = 0;
 static bool  g_depth_reversed = true;  // fixed fallback when NGX flags are unavailable
 static bool  g_depth_from_game = false;
+static unsigned g_dlss_flags = 0;
+static bool g_dlss_flags_known = false;
 // Creation flags may be absent from evaluate. Keep the full creation contract
 // across NR-only cleanup; retire it when its own provider releases the handle.
 static nr::FeatureRegistry g_features;
@@ -523,6 +526,8 @@ static void update_depth_guide(const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Par
              reversed ? "reversed" : "normal", known ? "game" : "fixed fallback", flags);
     g_depth_reversed = reversed;
     g_depth_from_game = known;
+    g_dlss_flags = flags;
+    g_dlss_flags_known = known;
 }
 
 // Network-side controls. We were leaving all of these unset, which meant the
@@ -1440,7 +1445,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             if (src && res_desc(src, &sd)) { w_net = (unsigned)sd.Width; h_net = sd.Height; }
         }
         ID3D12Resource *dst_col = nullptr;
-        if (g_use_hi && g_ptr_slot >= 0)
+        if (g_ptr_slot >= 0)
             param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_Output,
                            reinterpret_cast<void **>(&dst_col));
 
@@ -1452,6 +1457,72 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         ID3D12Resource      *in  = hi ? dst_col        : src;
 
         if (in && dep && mv) {
+            D3D12_RESOURCE_DESC depth_desc{}, motion_desc{}, output_desc{};
+            res_desc(dep, &depth_desc);
+            res_desc(mv, &motion_desc);
+            if (dst_col) res_desc(dst_col, &output_desc);
+
+            unsigned render_w = 0, render_h = 0;
+            unsigned depth_base_x = 0, depth_base_y = 0;
+            unsigned motion_base_x = 0, motion_base_y = 0;
+            params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &render_w);
+            params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &render_h);
+            params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depth_base_x);
+            params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depth_base_y);
+            params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &motion_base_x);
+            params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &motion_base_y);
+            if (render_w == 0) render_w = w_net;
+            if (render_h == 0) render_h = h_net;
+
+            const unsigned display_w = output_desc.Width ? (unsigned)output_desc.Width
+                                                         : (g_out_w ? g_out_w : w_net);
+            const unsigned display_h = output_desc.Height ? output_desc.Height
+                                                          : (g_out_h ? g_out_h : h_net);
+            const unsigned work_w = hi ? display_w : std::min(render_w, w_net);
+            const unsigned work_h = hi ? display_h : std::min(render_h, h_net);
+            const bool motion_low_resolution = g_dlss_flags_known
+                ? (g_dlss_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
+                : ((unsigned)motion_desc.Width <= render_w && motion_desc.Height <= render_h);
+
+            nr::GuideMetadataInput guide_input{};
+            guide_input.work_width = work_w;
+            guide_input.work_height = work_h;
+            guide_input.output_width = display_w;
+            guide_input.output_height = display_h;
+            guide_input.render_width = render_w;
+            guide_input.render_height = render_h;
+            guide_input.depth_width = depth_desc.Width ? (unsigned)depth_desc.Width : render_w;
+            guide_input.depth_height = depth_desc.Height ? depth_desc.Height : render_h;
+            guide_input.motion_width = motion_desc.Width ? (unsigned)motion_desc.Width
+                                                         : (motion_low_resolution ? render_w : display_w);
+            guide_input.motion_height = motion_desc.Height ? motion_desc.Height
+                                                           : (motion_low_resolution ? render_h : display_h);
+            guide_input.depth_base_x = depth_base_x;
+            guide_input.depth_base_y = depth_base_y;
+            guide_input.motion_base_x = motion_base_x;
+            guide_input.motion_base_y = motion_base_y;
+            guide_input.motion_low_resolution = motion_low_resolution;
+            nr::GuideMetadata guide_metadata = nr::resolve_guide_metadata(guide_input);
+
+            // Snapshot and skipped-frame codec kernels address guides by work-resolution
+            // pixel. Keep them off when a game supplies high-resolution or offset guides;
+            // the NR runtime itself understands the metadata forwarded below.
+            const bool local_guides = guide_metadata.depth.base_x == 0 &&
+                                      guide_metadata.depth.base_y == 0 &&
+                                      guide_metadata.depth.width == work_w &&
+                                      guide_metadata.depth.height == work_h &&
+                                      guide_metadata.motion.base_x == 0 &&
+                                      guide_metadata.motion.base_y == 0 &&
+                                      guide_metadata.motion.width == work_w &&
+                                      guide_metadata.motion.height == work_h;
+            if (!local_guides && (g_async_net || g_skip_n > 1)) {
+                static bool warned_nonlocal_guides = false;
+                if (!warned_nonlocal_guides) {
+                    warned_nonlocal_guides = true;
+                    logf("[NRPRE] high-resolution/offset guides: async snapshot disabled; "
+                         "cadence forced to 1 for correct motion sampling");
+                }
+            }
             const bool use_codec = g_codec_on && !hi && g_device != nullptr
                                    && codec_init(g_device, w_net, h_net);
             // Preflight the entire evaluation before snapshots, encode or NR.
@@ -1479,7 +1550,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 }
             };
             ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
-            if (g_async_net && g_cx.pso_snap != nullptr && dep != nullptr && mv != nullptr) {
+            if (g_async_net && !hi && local_guides && g_cx.pso_snap != nullptr &&
+                dep != nullptr && mv != nullptr) {
                 if (!g_cx.snap_ready) {
                     g_cx.snap_color = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R16G16B16A16_FLOAT);
                     g_cx.snap_depth = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R32_FLOAT);
@@ -1546,9 +1618,29 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 else if (ru == NVSDK_NGX_Result_Success && rst_u != 0) rst = 1;
                 if (msx == 0.0f) msx = 1.0f;
                 if (msy == 0.0f) msy = 1.0f;
-                pset_f(pp, "DLSSNR.MVecScaleX", msx);
-                pset_f(pp, "DLSSNR.MVecScaleY", msy);
-                g_mv_scale_x = msx; g_mv_scale_y = msy;   // the codec reprojects with these
+                guide_input.motion_scale_x = msx;
+                guide_input.motion_scale_y = msy;
+                guide_metadata = nr::resolve_guide_metadata(guide_input);
+                pset_u(pp, "DLSSNR.ColorSubrectWidth", work_w);
+                pset_u(pp, "DLSSNR.ColorSubrectHeight", work_h);
+                pset_u(pp, "DLSSNR.ColorSubrectBaseX", 0);
+                pset_u(pp, "DLSSNR.ColorSubrectBaseY", 0);
+                pset_u(pp, "DLSSNR.DepthSubrectWidth", guide_metadata.depth.width);
+                pset_u(pp, "DLSSNR.DepthSubrectHeight", guide_metadata.depth.height);
+                pset_u(pp, "DLSSNR.DepthSubrectBaseX", guide_metadata.depth.base_x);
+                pset_u(pp, "DLSSNR.DepthSubrectBaseY", guide_metadata.depth.base_y);
+                pset_u(pp, "DLSSNR.MVecSubrectWidth", guide_metadata.motion.width);
+                pset_u(pp, "DLSSNR.MVecSubrectHeight", guide_metadata.motion.height);
+                pset_u(pp, "DLSSNR.MVecSubrectBaseX", guide_metadata.motion.base_x);
+                pset_u(pp, "DLSSNR.MVecSubrectBaseY", guide_metadata.motion.base_y);
+                pset_u(pp, "DLSSNR.OutputSubrectWidth", work_w);
+                pset_u(pp, "DLSSNR.OutputSubrectHeight", work_h);
+                pset_u(pp, "DLSSNR.OutputSubrectBaseX", 0);
+                pset_u(pp, "DLSSNR.OutputSubrectBaseY", 0);
+                pset_f(pp, "DLSSNR.MVecScaleX", guide_metadata.motion_scale_x);
+                pset_f(pp, "DLSSNR.MVecScaleY", guide_metadata.motion_scale_y);
+                g_mv_scale_x = guide_metadata.motion_scale_x;
+                g_mv_scale_y = guide_metadata.motion_scale_y;
                 if (g_force_reset_frames > 0) { rst = 1; --g_force_reset_frames; }
                 if (rst != 0) g_reset_pending = true;
                 pset_u(pp, "DLSSNR.Reset", g_reset_pending ? 1u : 0u); // honour camera cuts
@@ -1580,7 +1672,15 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                          pre, escale, etex);
                 }
                 if (g_eval_logged < 3)
-                    logf("[NRPRE] guides: MVecScale=(%.3f, %.3f) reset=%u", msx, msy, rst);
+                    logf("[NRPRE] guides: work=%ux%u depth=%u,%u %ux%u mv=%u,%u %ux%u low=%d "
+                         "MVecScale=(%.3f, %.3f) reset=%u",
+                         work_w, work_h,
+                         guide_metadata.depth.base_x, guide_metadata.depth.base_y,
+                         guide_metadata.depth.width, guide_metadata.depth.height,
+                         guide_metadata.motion.base_x, guide_metadata.motion.base_y,
+                         guide_metadata.motion.width, guide_metadata.motion.height,
+                         (int)motion_low_resolution,
+                         guide_metadata.motion_scale_x, guide_metadata.motion_scale_y, rst);
             }
             pset_res(pp, "DLSSNR.Output", out);
             NVSDK_NGX_Result er = NVSDK_NGX_Result_Success;
@@ -1602,7 +1702,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // result. Skipped frames keep showing the last one, which is what makes
             // a lower cadence visible at all.
             const bool run_now = codec_refresh || (first_of_frame
-                              && ((g_skip_n <= 1)
+                              && ((g_skip_n <= 1 || !local_guides)
                                   || (((frame + g_phase) % (unsigned)g_skip_n) == 0)));
             if (g_jit_burst > 0) {
                 --g_jit_burst;

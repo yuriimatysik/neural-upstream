@@ -67,6 +67,25 @@ int main() {
         input.motion_low_resolution = true;
         const nr::GuideMetadata metadata = nr::resolve_guide_metadata(input);
         assert(metadata.depth.width == 90 && metadata.depth.height == 70);
-        assert(metadata.motion.width == 90 && metadata.motion.height == 70);
+        assert(metadata.motion.width == 100 && metadata.motion.height == 80);
+    }
+    {
+        nr::GuideMetadataInput input{};
+        input.work_width = 1708;
+        input.work_height = 964;
+        input.render_width = 1708;
+        input.render_height = 961;
+        input.output_width = 2560;
+        input.output_height = 1440;
+        input.depth_width = 1708;
+        input.depth_height = 964;
+        input.motion_width = 2592;
+        input.motion_height = 1472;
+        input.motion_low_resolution = false;
+        const nr::GuideMetadata metadata = nr::resolve_guide_metadata(input);
+        assert(metadata.depth.width == 1708 && metadata.depth.height == 961);
+        assert(metadata.motion.width == 2560 && metadata.motion.height == 1440);
+        assert(near(metadata.motion_scale_x, 1708.0f / 2560.0f));
+        assert(near(metadata.motion_scale_y, 964.0f / 1440.0f));
     }
 }

@@ -11,12 +11,16 @@ int main() {
     nr::FeatureRegistry registry;
     struct Handle { unsigned id; } dlss{1}, fg{1}, unknown{2};
     require(!registry.find(0, &unknown), "unobserved creation cannot authorize NR");
-    registry.created(0, &dlss, 13, 0xB, true);
+    registry.created(0, &dlss, 13, 0xB, true, 3840, 2160, true);
     registry.created(0, &fg, 11, 0, false);
     require(registry.find(0, &dlss)->allows_nr(), "ray reconstruction allows NR");
     require(!registry.find(0, &fg)->allows_nr(), "same numeric Id cannot authorize FG");
     require(registry.find(0, &dlss)->flags == 0xB,
             "FG creation does not overwrite DLSS depth flags");
+    require(registry.find(0, &dlss)->output_dimensions_valid &&
+            registry.find(0, &dlss)->output_width == 3840 &&
+            registry.find(0, &dlss)->output_height == 2160,
+            "DLSS output dimensions survive into evaluate contract");
 
     registry.created(1, &dlss, 11, 0, false);
     require(!registry.find(1, &dlss)->allows_nr() && registry.find(0, &dlss)->allows_nr(),
@@ -30,7 +34,9 @@ int main() {
     require(!registry.find(0, &dlss)->allows_nr() && !registry.find(0, &dlss)->flags_valid,
             "recycled DLSS address may become FG without inheriting flags");
     registry.created(0, &dlss, 1, 0, false);
-    require(registry.find(0, &dlss)->allows_nr(), "super sampling allows NR without flags");
+    require(registry.find(0, &dlss)->allows_nr() &&
+            !registry.find(0, &dlss)->output_dimensions_valid,
+            "super sampling allows NR without optional creation metadata");
     for (unsigned feature : {0u, 4u, 11u, 12u, 18u, 32766u}) {
         registry.created(0, &unknown, feature, 0xB, true);
         require(!registry.find(0, &unknown)->allows_nr(),

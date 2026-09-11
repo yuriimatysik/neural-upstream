@@ -63,6 +63,18 @@ static NVSDK_NGX_Result param_get_slot(const NVSDK_NGX_Parameter *p, unsigned sl
     return reinterpret_cast<PFN_GetPtr>(vtbl[slot])(p, key, out);
 }
 
+// MinGW orders overloaded NGX virtuals differently from the MSVC object supplied
+// by the driver. Read unsigned values through the known MSVC vtable slot.
+static bool param_get_unsigned(const NVSDK_NGX_Parameter *p, const char *key, unsigned &out) {
+    if (!p) return false;
+    using GetUnsigned = NVSDK_NGX_Result (STDMETHODCALLTYPE *)(
+        const NVSDK_NGX_Parameter *, const char *, unsigned *);
+    auto **vtbl = *reinterpret_cast<void ***>(const_cast<NVSDK_NGX_Parameter *>(p));
+    out = 0;
+    return reinterpret_cast<GetUnsigned>(vtbl[12])(p, key, &out) ==
+           NVSDK_NGX_Result_Success;
+}
+
 static bool looks_like_com(void *pv) {
     if (pv == nullptr || (reinterpret_cast<uintptr_t>(pv) & 7) != 0) return false;
     MEMORY_BASIC_INFORMATION mbi{};
@@ -478,6 +490,9 @@ static bool  g_depth_reversed = true;  // fixed fallback when NGX flags are unav
 static bool  g_depth_from_game = false;
 static unsigned g_dlss_flags = 0;
 static bool g_dlss_flags_known = false;
+static unsigned g_dlss_output_w = 0, g_dlss_output_h = 0;
+static bool g_dlss_output_known = false;
+static bool g_guides_force_quality = false;
 // Creation flags may be absent from evaluate. Keep the full creation contract
 // across NR-only cleanup; retire it when its own provider releases the handle.
 static nr::FeatureRegistry g_features;
@@ -505,7 +520,8 @@ static bool read_dlss_flags(const NVSDK_NGX_Parameter *params, unsigned &flags) 
     return (flags & static_cast<unsigned>(NVSDK_NGX_DLSS_Feature_Flags_IsInvalid)) == 0;
 }
 
-static void update_depth_guide(const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *params) {
+static void update_dlss_guide_contract(const NVSDK_NGX_Handle *feat,
+                                       const NVSDK_NGX_Parameter *params) {
     unsigned flags = 0;
     bool known = false;
     const auto *saved = g_features.find(t_ngx_provider, feat);
@@ -528,6 +544,20 @@ static void update_depth_guide(const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Par
     g_depth_from_game = known;
     g_dlss_flags = flags;
     g_dlss_flags_known = known;
+
+    unsigned output_w = 0, output_h = 0;
+    bool output_known = saved && saved->output_dimensions_valid;
+    if (output_known) {
+        output_w = saved->output_width;
+        output_h = saved->output_height;
+    } else {
+        output_known = param_get_unsigned(params, NVSDK_NGX_Parameter_OutWidth, output_w) &&
+                       param_get_unsigned(params, NVSDK_NGX_Parameter_OutHeight, output_h) &&
+                       output_w != 0 && output_h != 0;
+    }
+    g_dlss_output_w = output_w;
+    g_dlss_output_h = output_h;
+    g_dlss_output_known = output_known;
 }
 
 // Network-side controls. We were leaving all of these unset, which meant the
@@ -1377,7 +1407,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
     if (!cmd || !params || !color_w || !color_h || !prepare_recording(cmd))
         return t_orig_eval(cmd, feat, params, cb);
 
-    update_depth_guide(feat, params);
+    update_dlss_guide_contract(feat, params);
 
     {   // heartbeat: proves whether the hook survives a device/swapchain recreation
         static unsigned long long hb = 0;
@@ -1410,8 +1440,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         describe(params, NVSDK_NGX_Parameter_Depth,         depth,  sizeof depth);
         describe(params, NVSDK_NGX_Parameter_MotionVectors, mvec,   sizeof mvec);
         unsigned rw = 0, rh = 0;
-        params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  &rw);
-        params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &rh);
+        param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, rw);
+        param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, rh);
         if (g_logged < 12) {
             logf("[NRPRE] eval feat=%u  render_subrect=%ux%u | %s | %s | %s | %s",
                  feat_id(feat), rw, rh, color, output, depth, mvec);
@@ -1465,21 +1495,33 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             unsigned render_w = 0, render_h = 0;
             unsigned depth_base_x = 0, depth_base_y = 0;
             unsigned motion_base_x = 0, motion_base_y = 0;
-            params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &render_w);
-            params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &render_h);
-            params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depth_base_x);
-            params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depth_base_y);
-            params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &motion_base_x);
-            params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &motion_base_y);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                               render_w);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                               render_h);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X,
+                               depth_base_x);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y,
+                               depth_base_y);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X,
+                               motion_base_x);
+            param_get_unsigned(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y,
+                               motion_base_y);
             if (render_w == 0) render_w = w_net;
             if (render_h == 0) render_h = h_net;
 
-            const unsigned display_w = output_desc.Width ? (unsigned)output_desc.Width
-                                                         : (g_out_w ? g_out_w : w_net);
-            const unsigned display_h = output_desc.Height ? output_desc.Height
-                                                          : (g_out_h ? g_out_h : h_net);
-            const unsigned work_w = hi ? display_w : std::min(render_w, w_net);
-            const unsigned work_h = hi ? display_h : std::min(render_h, h_net);
+            const unsigned output_allocation_w = output_desc.Width ? (unsigned)output_desc.Width
+                                                                   : (g_out_w ? g_out_w : w_net);
+            const unsigned output_allocation_h = output_desc.Height ? output_desc.Height
+                                                                    : (g_out_h ? g_out_h : h_net);
+            const unsigned output_valid_w = g_dlss_output_known
+                ? std::min(g_dlss_output_w, output_allocation_w) : output_allocation_w;
+            const unsigned output_valid_h = g_dlss_output_known
+                ? std::min(g_dlss_output_h, output_allocation_h) : output_allocation_h;
+            // Feature and codec textures use allocation dimensions. RenderSubrect only
+            // describes the valid depth region; some games pad Color by a few rows.
+            const unsigned work_w = hi ? output_allocation_w : w_net;
+            const unsigned work_h = hi ? output_allocation_h : h_net;
             const bool motion_low_resolution = g_dlss_flags_known
                 ? (g_dlss_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
                 : ((unsigned)motion_desc.Width <= render_w && motion_desc.Height <= render_h);
@@ -1487,16 +1529,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             nr::GuideMetadataInput guide_input{};
             guide_input.work_width = work_w;
             guide_input.work_height = work_h;
-            guide_input.output_width = display_w;
-            guide_input.output_height = display_h;
+            guide_input.output_width = output_valid_w;
+            guide_input.output_height = output_valid_h;
             guide_input.render_width = render_w;
             guide_input.render_height = render_h;
             guide_input.depth_width = depth_desc.Width ? (unsigned)depth_desc.Width : render_w;
             guide_input.depth_height = depth_desc.Height ? depth_desc.Height : render_h;
             guide_input.motion_width = motion_desc.Width ? (unsigned)motion_desc.Width
-                                                         : (motion_low_resolution ? render_w : display_w);
+                                                         : (motion_low_resolution ? render_w : output_valid_w);
             guide_input.motion_height = motion_desc.Height ? motion_desc.Height
-                                                           : (motion_low_resolution ? render_h : display_h);
+                                                           : (motion_low_resolution ? render_h : output_valid_h);
             guide_input.depth_base_x = depth_base_x;
             guide_input.depth_base_y = depth_base_y;
             guide_input.motion_base_x = motion_base_x;
@@ -1509,12 +1551,14 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // the NR runtime itself understands the metadata forwarded below.
             const bool local_guides = guide_metadata.depth.base_x == 0 &&
                                       guide_metadata.depth.base_y == 0 &&
-                                      guide_metadata.depth.width == work_w &&
-                                      guide_metadata.depth.height == work_h &&
+                                      depth_desc.Width == work_w && depth_desc.Height == work_h &&
                                       guide_metadata.motion.base_x == 0 &&
                                       guide_metadata.motion.base_y == 0 &&
-                                      guide_metadata.motion.width == work_w &&
-                                      guide_metadata.motion.height == work_h;
+                                      motion_desc.Width == work_w && motion_desc.Height == work_h;
+            g_guides_force_quality = !local_guides;
+            const int effective_cadence = local_guides ? g_skip_n : 1;
+            const bool temporal_reuse_allowed = effective_cadence > 1;
+            if (!temporal_reuse_allowed) g_delta_valid = false;
             if (!local_guides && (g_async_net || g_skip_n > 1)) {
                 static bool warned_nonlocal_guides = false;
                 if (!warned_nonlocal_guides) {
@@ -1550,6 +1594,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 }
             };
             ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
+            bool snapshot_used = false;
             if (g_async_net && !hi && local_guides && g_cx.pso_snap != nullptr &&
                 dep != nullptr && mv != nullptr) {
                 if (!g_cx.snap_ready) {
@@ -1582,6 +1627,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     net_color = g_cx.snap_color;
                     net_depth = g_cx.snap_depth;
                     net_mv    = g_cx.snap_mv;
+                    snapshot_used = true;
                 }
             }
             const bool codec_refresh = use_codec && g_codec_settings_dirty;
@@ -1702,8 +1748,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             // result. Skipped frames keep showing the last one, which is what makes
             // a lower cadence visible at all.
             const bool run_now = codec_refresh || (first_of_frame
-                              && ((g_skip_n <= 1 || !local_guides)
-                                  || (((frame + g_phase) % (unsigned)g_skip_n) == 0)));
+                              && ((effective_cadence <= 1)
+                                  || (((frame + g_phase) % (unsigned)effective_cadence) == 0)));
             if (g_jit_burst > 0) {
                 --g_jit_burst;
                 float jx = 0.0f, jy = 0.0f;
@@ -1788,15 +1834,6 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 // After a staged pass the stage buffer sits in SRV (it was the
                 // last input); park it in UAV so the next frame can stage into it.
                 if (staged) barrier_transition(cmd, stage, kSRV, kUAV);
-                if (g_async_net && g_cx.snap_ready) {
-                    // back to UAV so the next frame's snapshot can write them again
-                    barrier_transition(cmd, g_cx.snap_color,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    barrier_transition(cmd, g_cx.snap_depth,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    barrier_transition(cmd, g_cx.snap_mv,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                }
                 ++g_eval_count;
                 g_reset_pending = (er != NVSDK_NGX_Result_Success);
                 if (er != NVSDK_NGX_Result_Success) {
@@ -1818,7 +1855,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     // network just produced becomes the *next* frame's delta, below.
                     // Needs a delta to exist, so the first run frame still decodes.
                     const bool uniform = g_uniform_delta && g_delta_reuse
-                                      && g_delta_valid && g_skip_n > 1;
+                                      && g_delta_valid && temporal_reuse_allowed;
                     if (uniform) {
                         if (g_delta_advect)
                             advect_delta(cmd, g_device, in, mv, dep, w_net, h_net);
@@ -1833,7 +1870,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                         uav_barrier(cmd, g_cx.final_tex);
                     }
                     // Capture what the network changed, while both inputs are still SRV.
-                    if (g_delta_reuse && g_skip_n > 1) {
+                    if (g_delta_reuse && temporal_reuse_allowed) {
                         codec_dispatch(cmd, g_device, g_cx.pso_delta, in, g_cx.proxy, out,
                                        g_cx.delta, w_net, h_net, nullptr, dep);
                         uav_barrier(cmd, g_cx.delta);
@@ -1846,7 +1883,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 }
                 prof_mark(cmd, 3);
                 prof_resolve(cmd);
-            } else if (use_codec && g_delta_reuse && g_delta_valid) {
+            } else if (use_codec && g_delta_reuse && g_delta_valid && temporal_reuse_allowed) {
                 ensure_recording();
                 // Skipped frame: develop the *current* colour and re-apply the stored
                 // effect to it. No network, so the saving stands, but the image being
@@ -1866,6 +1903,17 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 if (g_delta_age < 8) ++g_delta_age;   // one more frame behind
             }
 
+            if (snapshot_used) {
+                // Snapshot capture happens before the cadence decision, so restore
+                // write states even when this frame does not run the network.
+                barrier_transition(cmd, g_cx.snap_color,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                barrier_transition(cmd, g_cx.snap_depth,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                barrier_transition(cmd, g_cx.snap_mv,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+
             // --- 2d: hand the processed image to the game's DLSS as its colour input.
             // Never feed a texture we have not written yet: uninitialised memory
             // shows up as a black screen.
@@ -1881,7 +1929,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             ID3D12Resource *feed = (er != NVSDK_NGX_Result_Success || g_descriptor_failed)
                 ? nullptr : (use_codec ? (g_final_valid ? g_cx.final_tex : nullptr) : out);
-            const bool delta_fed = use_codec && g_delta_reuse && g_delta_valid && g_skip_n > 1;
+            const bool delta_fed = use_codec && g_delta_reuse && g_delta_valid &&
+                                   temporal_reuse_allowed;
             // !run_now covers two different situations and they need opposite
             // answers. One is a frame the cadence genuinely skipped. The other is a
             // *repeat* evaluate of the frame we just processed -- the game issues
@@ -2039,12 +2088,10 @@ static void *const kEvalThunks[kMaxNgx] = {
 };
 
 // ---- CreateFeature hook: learn the DLSSNR feature id and the params it is given ----
-typedef NVSDK_NGX_Result (STDMETHODCALLTYPE *PFN_GetU)(const NVSDK_NGX_Parameter *, const char *, unsigned *);
 typedef NVSDK_NGX_Result (STDMETHODCALLTYPE *PFN_GetF)(const NVSDK_NGX_Parameter *, const char *, float *);
 static unsigned pget_u(const NVSDK_NGX_Parameter *p, const char *k) {
-    auto **v = *reinterpret_cast<void ***>(const_cast<NVSDK_NGX_Parameter *>(p));
-    unsigned out = 0;                                   // MSVC slot 12 = Get(unsigned int*)
-    if (reinterpret_cast<PFN_GetU>(v[12])(p, k, &out) != NVSDK_NGX_Result_Success) return 0xFFFFFFFFu;
+    unsigned out = 0;
+    if (!param_get_unsigned(p, k, out)) return 0xFFFFFFFFu;
     return out;
 }
 static float pget_f(const NVSDK_NGX_Parameter *p, const char *k) {
@@ -2066,10 +2113,16 @@ static NVSDK_NGX_Result NVSDK_CONV hk_create_t(ID3D12GraphicsCommandList *cmd, N
     const bool dlss = id == NVSDK_NGX_Feature_SuperSampling || id == NVSDK_NGX_Feature_RayReconstruction;
     unsigned flags = 0;
     const bool flags_valid = dlss && read_dlss_flags(params, flags);
+    unsigned output_w = 0, output_h = 0;
+    const bool output_dimensions_valid = dlss &&
+        param_get_unsigned(params, NVSDK_NGX_Parameter_OutWidth, output_w) &&
+        param_get_unsigned(params, NVSDK_NGX_Parameter_OutHeight, output_h) &&
+        output_w != 0 && output_h != 0;
     NVSDK_NGX_Result r = g_orig_create_n[Index](cmd, id, params, out);
     if (r == NVSDK_NGX_Result_Success && out && *out) {
         std::lock_guard<std::recursive_mutex> lock(g_state_mutex);
-        g_features.created(Index, *out, static_cast<unsigned>(id), flags, flags_valid);
+        g_features.created(Index, *out, static_cast<unsigned>(id), flags, flags_valid,
+                           output_w, output_h, output_dimensions_valid);
         logf("[NRPRE] feature contract: module=%u feature=%u handle=%p id=%u flags=0x%08X valid=%d",
              Index, (unsigned)id, (void *)*out, feat_id(*out), flags, (int)flags_valid);
     }
@@ -2810,6 +2863,9 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                             "since the reused effect is older.");
         break;
     }
+    if (g_guides_force_quality && (g_skip_n > 1 || g_async_net))
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+            "Current guide layout forces Quality and disables async capture.");
 
     ImGui::Spacing();
     ImGui::TextDisabled("How far it may go");
@@ -3495,6 +3551,11 @@ static void service_pending_cleanup() {
     g_final_valid = false;
     g_delta_valid = false;
     g_pw_valid = false; g_guides_valid = false;
+    g_dlss_flags = 0;
+    g_dlss_flags_known = false;
+    g_dlss_output_w = g_dlss_output_h = 0;
+    g_dlss_output_known = false;
+    g_guides_force_quality = false;
     g_net_w = g_net_h = 0;
     g_setup_w = g_setup_h = 0;
     g_nr_eval = g_snip_eval = nullptr;

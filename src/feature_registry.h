@@ -14,14 +14,19 @@ public:
         unsigned feature;
         unsigned flags;
         bool flags_valid;
+        unsigned output_width;
+        unsigned output_height;
+        bool output_dimensions_valid;
         bool reported = false;
         bool allows_nr() const { return feature == 1 || feature == 13; }
     };
 
     void created(unsigned provider, const void *handle, unsigned feature,
-                 unsigned flags, bool flags_valid) {
+                 unsigned flags, bool flags_valid, unsigned output_width = 0,
+                 unsigned output_height = 0, bool output_dimensions_valid = false) {
         if (handle) entries_[{provider, reinterpret_cast<std::uintptr_t>(handle)}] =
-            {feature, flags, flags_valid, false};
+            {feature, flags, flags_valid, output_width, output_height,
+             output_dimensions_valid, false};
     }
 
     Contract *find(unsigned provider, const void *handle) {

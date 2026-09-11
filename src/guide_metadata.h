@@ -58,8 +58,8 @@ inline GuideMetadata resolve_guide_metadata(const GuideMetadataInput &input) {
     result.depth = clamp_guide_region(input.depth_base_x, input.depth_base_y,
                                       render_width, render_height,
                                       input.depth_width, input.depth_height);
-    const unsigned motion_width = input.motion_low_resolution ? result.depth.width : output_width;
-    const unsigned motion_height = input.motion_low_resolution ? result.depth.height : output_height;
+    const unsigned motion_width = input.motion_low_resolution ? render_width : output_width;
+    const unsigned motion_height = input.motion_low_resolution ? render_height : output_height;
     result.motion = clamp_guide_region(input.motion_base_x, input.motion_base_y,
                                        motion_width, motion_height,
                                        input.motion_width, input.motion_height);

@@ -68,5 +68,7 @@ of failed evaluates and frames that passed through untouched. It is off by
 default because its GPU readback and logging sit on the present thread and can
 cost a frame.
 
-F7 toggles NR and clears its temporal history when turning it back on. F6 switches
-Effect strength between normal (1) and exaggerated diagnostic strength (3).
+F7 is the only NR hotkey and clears temporal history when turning NR back on.
+The overlay can also toggle NR. A short debounce prevents one key press from
+toggling twice. Network passes are locked to one; old Passes values are repaired
+to 1 when loaded. F6 and F9 no longer change NR state.

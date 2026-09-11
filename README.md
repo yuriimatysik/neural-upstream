@@ -4,7 +4,7 @@
 
 This fork combines the Stellar Blade fixes from upstream issue #3, the
 community-runtime fixes in PR #4, Leonardo Capellaro's stability and frame
-generation work, his v0.5.0 multi-pass and highlight changes, and additional
+generation work, his v0.5.0 highlight changes, and additional
 recovery fixes for the in-game controls.
 
 ### Bug fixes
@@ -28,8 +28,8 @@ recovery fixes for the in-game controls.
   logging opt-in, under **Developer diagnostics** in the overlay.
 - **Early NGX hook failure:** retry until a complete lifecycle/evaluate hook set
   succeeds and remove partial hooks before retrying.
-- **Multi-pass device removal:** copy each NR result into a dedicated staging
-  texture before feeding it into another network pass.
+- **Repeated passes compounding the image:** permanently lock NR to one network
+  pass and repair old configurations that saved a higher `Passes` value.
 
 It also includes the earlier resource-dimension and typed-view corrections,
 explicit NR input/output geometry, scratch-buffer fallback, safe resource
@@ -59,8 +59,7 @@ contributed testing and bug reports through
 Special thanks to **Leonardo Capellaro** for the
 [stability and frame-generation fixes](https://github.com/leonardocapellaro/neural-upstream).
 His submission tracking, feature isolation, descriptor lifetime and depth-guide
-work, plus the multi-pass staging and highlight/detail controls, are incorporated
-into this fork.
+work, plus the highlight/detail controls, are incorporated into this fork.
 
 See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
 builds, installation and detailed validation notes.
@@ -176,11 +175,12 @@ module's path containing `nvngx.dll`; under any other name it returns
 Needs ReShade with add-on support, and `nvngx_dlssnr.dll` in the game folder.
 Everything is configured from the ReShade overlay.
 
-`F7` is the only Neural Rendering toggle and clears temporal history when turning
-it back on. A short debounce prevents one key press from toggling twice. Network
-passes are locked to one because repeated passes compound the effect, darken the
-image and can make highlights look artificial. Old `Passes` values are repaired
-to `1` when loaded. `F6` and `F9` no longer change NR state.
+`F7` is the only Neural Rendering hotkey and clears temporal history when turning
+NR back on. The overlay can also toggle NR. A short debounce prevents one key
+press from toggling twice. Network passes are locked to one because repeated
+passes compound the effect, darken the image and can make highlights look
+artificial. Old `Passes` values are repaired to `1` when loaded. `F6` and `F9`
+no longer change NR state.
 
 ## Where the time goes
 

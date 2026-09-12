@@ -66,6 +66,25 @@ residual concept from xenmods'
 [DLSSNR-Cost-Scaler v1.0.5](https://github.com/xenmods/DLSSNR-Cost-Scaler/tree/9bb03663d690b84ec00cdb55fb3a1a04dd881e02).
 Its external HDR resolve, RCAS, hotkeys and lifetime scheme are not included.
 
+### Experimental scaler highlights
+
+- **Physical neural-resolution scaling:** runs NR at 100%, 85% or 75% of the
+  encoded proxy dimensions, reducing neural GPU work roughly with the square of
+  the selected scale.
+- **Matched residual reconstruction:** adds only the low-resolution NR delta
+  back to the native proxy, preserving the game's full-resolution detail and
+  HDR range.
+- **Depth-aware edge protection:** reduces residual strength near depth
+  discontinuities, which helps limit dark edge halos and unstable small shadows.
+- **Single integrated HDR resolve:** keeps the existing colour, lighting,
+  chroma and detail handling in one resolve, avoiding a second contrast-changing
+  pass.
+- **Safe live Apply:** fence-tracked cleanup pauses NR while resources change,
+  then activates the newest requested scale without leaving stale GPU work.
+- **Practical result:** on the tested setup, frame rate is close to running
+  without DLSS 5, while image quality remains close to the 100% neural
+  resolution path.
+
 See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
 builds, installation and detailed validation notes.
 

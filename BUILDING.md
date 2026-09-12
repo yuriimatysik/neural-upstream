@@ -59,8 +59,9 @@ CXX=g++ sh tests/run.sh
 ```
 
 The codec tests execute scalar functions extracted from the actual shader and
-check highlight retention after FP16 storage, gamut bounds, shadow guards and
-detail/lighting invariants. To also compile all seven HLSL entry points with an
+check highlight retention after FP16 storage, gamut bounds, shadow guards,
+matched-residual identities, scale planning and detail/lighting invariants. To
+also compile all nine HLSL entry points with an
 installed Microsoft DXC, set `DXC=/path/to/dxc` on that command. This checks SM6
 syntax; the add-on still compiles `cs_5_0` through `d3dcompiler_47.dll` at runtime.
 Neither host test replaces Windows/GPU validation or measures visual quality.
@@ -140,5 +141,11 @@ Compilation and export checks do not establish game compatibility. Test:
     `nested DLSS bypass` means the non-DLSS nesting guard encountered a known
     upscaler; zero does not prove the final displayed image contains NR. This
     instrumentation does not change rendering or saved settings.
+13. For the experimental scaler, compare `v0.6.0` against `ResolutionScale=1.0`.
+    Confirm the same image and no scaler PSOs/resources in the log. Apply
+    `1.0 ↔ 0.75` ten times, including alt-tab and resize during cleanup.
+14. Run at least 30 minutes each at `0.85` and `0.75`. Inspect faces, necks,
+    fine shadows and dark edges, and confirm NR GPU time falls. Scaled mode must
+    report Quality cadence and must not use delta reuse or async snapshots.
 
 Do not describe these binaries as game-tested until these checks run on the target GPU.

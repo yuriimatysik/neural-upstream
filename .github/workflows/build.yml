@@ -14,7 +14,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Test recording, descriptor and NGX feature lifecycles
+      - name: Fetch pinned DirectX Shader Compiler
+        run: |
+          curl -L --fail --retry 3 -o /tmp/linux-dxc.tar.gz \
+            https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/linux_dxc_2026_05_26.x86_64.tar.gz
+          echo '928b3e9986d11dc4279050e02340950c29bcbd1e5efb9d3ded9669dade37639d  /tmp/linux-dxc.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/dxc
+          tar -xzf /tmp/linux-dxc.tar.gz -C /tmp/dxc
+      - name: Test lifecycles, scale math and all HLSL entry points
+        env:
+          DXC: /tmp/dxc/bin/dxc
+          LD_LIBRARY_PATH: /tmp/dxc/lib
         run: sh tests/run.sh
       - name: Install Windows cross compiler
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix

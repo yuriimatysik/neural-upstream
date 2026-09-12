@@ -19,11 +19,11 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 shader = (root / "src/codec.hlsl.h").read_text()
 functions = {"HighlightShoulder": "ffI", "GamutChromaScale": "ff",
-             "LuminanceGain": "ff", "ShapeLogGain": "ffff"}
+             "LuminanceGain": "ff", "ShapeLogGain": "ffff", "MatchedResidual": "ffff"}
 
 
 def extract(name):
-    start = shader.index("float " + name + "(")
+    start = shader.index(("float3 " if name == "RestoreRange" else "float ") + name + "(")
     opening = shader.index("{", start)
     depth = 1
     end = opening + 1
@@ -50,7 +50,22 @@ using std::clamp;
 using std::max;
 using std::exp;
 float saturate(float x) { return std::clamp(x, 0.0f, 1.0f); }
+struct float3 { float x, y, z; };
+float3 operator*(float3 a, float b) { return {a.x*b,a.y*b,a.z*b}; }
+float3 operator/(float3 a, float b) { return {a.x/b,a.y/b,a.z/b}; }
+float3 lerp(float3 a, float3 b, float t) {
+    return {a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.z+(b.z-a.z)*t};
+}
+float Luminance(float3 a) { return a.x*0.212639f+a.y*0.715169f+a.z*0.072192f; }
+float ChromaTransfer = 0, TransferStrength = 1;
+""" + extract("RestoreRange") + """
 extern "C" {
+float restore_channel(float original, float proxy, float neural, float gain, float chroma) {
+    ChromaTransfer = chroma;
+    return RestoreRange({original, original*0.5f, original*0.25f},
+                        {proxy,proxy*0.5f,proxy*0.25f},
+                        {neural,neural*0.5f,neural*0.25f},gain).x;
+}
 """ + "\n".join(extract(name) for name in functions) + "\n}\n")
     subprocess.run(shlex.split(os.environ.get("CXX", "g++")) +
                    ["-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror",
@@ -60,6 +75,20 @@ extern "C" {
         fn = getattr(native, name)
         fn.restype = ctypes.c_float
         fn.argtypes = [ctypes.c_uint if a == "I" else ctypes.c_float for a in args]
+
+    restore = native.restore_channel
+    restore.restype = ctypes.c_float
+    restore.argtypes = [ctypes.c_float] * 5
+    for original in (0, 1e-8, 0.01, 1, 4, 100, 4096):
+        for proxy in (0, 1e-8, 0.01, 0.5, 1):
+            for chroma in (0, 0.5, 1):
+                # Identity NR survives the production HDR/chroma restore.
+                close(restore(original, proxy, proxy, 1, chroma), original,
+                      max(2e-6, original*2e-6))
+                for neural in (0, 0.1, 1):
+                    gain = native.LuminanceGain(proxy, neural)
+                    value = restore(original, proxy, neural, gain, chroma)
+                    assert math.isfinite(value) and 0 <= value <= original*8.00001+1e-6
 
     shoulder = native.HighlightShoulder
     for knee in (0.05, 0.3, 0.75, 0.892, 0.99):
@@ -127,14 +156,26 @@ extern "C" {
     close(shape(0.1, 0, 1.15, 1), 0.115)
     close(shape(-0.1, 0, 1.15, 1), -0.115)
 
+    # Matched residual invariants. Identity NR preserves the full-resolution
+    # proxy; at native resolution the residual reconstruction equals NR exactly.
+    def matched(proxy, low_input, low_output, depth_weight=1.0):
+        return native.MatchedResidual(proxy, low_input, low_output, depth_weight)
+
+    for proxy in (0.0, 0.01, 0.25, 0.75, 1.0):
+        close(matched(proxy, proxy, proxy), proxy)
+        for neural in (0.0, 0.1, 0.5, 0.9, 1.0):
+            close(matched(proxy, proxy, neural), neural)
+            guarded = matched(proxy, proxy, neural, 0.25)
+            assert math.isfinite(guarded) and 0 <= guarded <= 1
+
     print(f"codec math: all checks passed; FP16 highlights legacy={legacy}, gradual={gradual}")
     if os.environ.get("DXC"):
         hlsl = Path(tmp) / "codec.hlsl"
         hlsl.write_text(shader.split('R"HLSL(', 1)[1].rsplit(')HLSL"', 1)[0])
         entries = re.findall(r"void (CS\w+)\(uint3 tid", shader)
-        assert len(entries) == 7, entries
+        assert len(entries) == 9, entries
         for entry in entries:
             subprocess.run([os.environ["DXC"], "-T", "cs_6_0", "-HV", "2018",
                             "-E", entry, "-Fo", str(Path(tmp) / (entry + ".dxil")),
                             str(hlsl)], check=True)
-        print("codec HLSL: all 7 entry points compiled with DXC (SM6)")
+        print("codec HLSL: all 9 entry points compiled with DXC (SM6)")

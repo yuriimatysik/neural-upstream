@@ -61,6 +61,11 @@ Special thanks to **Leonardo Capellaro** for the
 His submission tracking, feature isolation, descriptor lifetime and depth-guide
 work, plus the highlight/detail controls, are incorporated into this fork.
 
+The experimental physical-resolution path adapts the downsample and matched
+residual concept from xenmods'
+[DLSSNR-Cost-Scaler v1.0.5](https://github.com/xenmods/DLSSNR-Cost-Scaler/tree/9bb03663d690b84ec00cdb55fb3a1a04dd881e02).
+Its external HDR resolve, RCAS, hotkeys and lifetime scheme are not included.
+
 See [BUILDING.md](BUILDING.md) for pinned dependencies, automated Windows DLL
 builds, installation and detailed validation notes.
 
@@ -84,6 +89,27 @@ Memory: Infinite benchmark; additional community testing is listed above.
 DLSSNR feature at the game's render resolution, runs it on the colour buffer the
 game was about to hand DLSS, and rebinds the result before letting the call
 through.
+
+**Experimental neural resolution scale.** `ResolutionScale` physically reduces
+the encoded NR input and output dimensions from 50% to 100%. At values below
+100%, one bilinear pass creates the smaller proxy, NR runs at those real
+dimensions with `DLSSNR.ScalingRatio=1.0`, and one integrated matched-residual
+decode adds `lowNR - lowInput` back to the full-resolution proxy before the
+existing HDR/chroma/detail restore. A five-tap full-resolution depth check fades
+the residual to 25% around discontinuities. Missing or incompatible depth simply
+disables that guard for the frame.
+
+The default is `ResolutionScale=1.0`. At 100% the scaler PSOs, dispatches and
+small textures are not created, and the established encode → NR → decode path is
+used unchanged. The old `NetScale` setting is ignored and normalized to `1.0`, so
+it cannot trigger a second NGX scaling operation.
+
+In ReShade, move **Neural resolution scale**, choose 100%/85%/75%, then press
+**Apply**. Apply pauses NR in passthrough until fence-tracked GPU work finishes;
+several edits during cleanup collapse to the newest requested value. Scaled mode
+requires the codec and always uses Quality cadence without async snapshots or
+delta reuse. The standalone build reads the same `ResolutionScale` key from
+`neural-upstream.ini`; restart the game to apply it there.
 
 **Colour.** The network expects a bounded, display-referred image; this game
 hands DLSS a scene-linear HDR buffer. That buffer is normalised and rolled off

@@ -22,6 +22,7 @@
 #include "feature_registry.h"
 #include "control_state.h"
 #include "guide_metadata.h"
+#include "resolution_scale.h"
 #include <atomic>
 #include <new>
 #include <vector>
@@ -143,9 +144,16 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd);   
 static nr::ControlState g_controls; // starts enabled and visible; UI and hotkeys share this state
 static unsigned g_net_w, g_net_h;
 static unsigned g_setup_w = 0, g_setup_h = 0;
+static unsigned g_work_w = 0, g_work_h = 0;
 static std::recursive_mutex g_state_mutex;
 static bool g_resize_pending = false;
 static bool g_submission_failed = false;
+static float g_requested_resolution_scale = 1.0f;
+static float g_active_resolution_scale = 1.0f;
+static bool g_resolution_setting_loaded = false;
+static bool g_scale_apply_pending = false;
+static bool g_scale_restart_required = false;
+static bool g_scale_failed_session = false;
 static bool install_submission_hook(ID3D12CommandQueue *queue);
 static bool prepare_recording(ID3D12GraphicsCommandList *cmd);
 static void track_recording(ID3D12GraphicsCommandList *cmd);
@@ -431,7 +439,8 @@ static ID3D12Resource *make_uav_tex(ID3D12Device *, unsigned, unsigned, DXGI_FOR
 static void codec_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12PipelineState *,
                            ID3D12Resource *, ID3D12Resource *, ID3D12Resource *,
                            ID3D12Resource *, unsigned, unsigned,
-                           ID3D12Resource * = nullptr, ID3D12Resource * = nullptr);
+                           ID3D12Resource * = nullptr, ID3D12Resource * = nullptr,
+                           bool = false);
 static void advect_delta(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Resource *,
                          ID3D12Resource *, ID3D12Resource *, unsigned, unsigned);
 static void snapshot_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *,
@@ -451,6 +460,18 @@ static float g_lighting_strength = 1.0f;
 static bool g_codec_settings_dirty = false;
 static constexpr UINT kCodecConstants = 20;
 static float g_knee = 0.75f;           // shoulder start of the development curve
+
+static void set_codec_enabled(bool enabled) {
+    if (g_codec_on == enabled) return;
+    const bool cleanup = nr::codec_requires_resolution_cleanup(g_codec_on, enabled, g_active_resolution_scale);
+    g_codec_on = enabled;
+    if (cleanup) {
+        g_scale_apply_pending = !g_submission_failed;
+        g_scale_restart_required = true;
+        release_state("codec disabled while scaled");
+    }
+    g_codec_settings_dirty = true;
+}
 
 // Live status shown in the overlay.
 static float g_ui_ms = 0.0f, g_ui_fps = 0.0f, g_ui_nr_hz = 0.0f;
@@ -567,14 +588,8 @@ static float g_local_tone = 0.15f;
 static float g_local_structure = 0.70f;
 static float g_skin_structure = -1.0f;  // -1 = leave to the network
 static int   g_style = 0;
-// The network is 4.9 ms of the 8.9 ms frame -- 56% of the budget, measured, and
-// at cadence 2 it lands on every other frame, so the rendered interval swings
-// 8.9/13.9 ms and DLSS-G cannot pace through that. The feature already carries a
-// scaling knob; if it means what it says, running the net below render resolution
-// cuts the cost by area and the delta -- which is low frequency, and already
-// sampled bilinearly -- is the right thing to compute coarsely. 1.0 keeps today's
-// behaviour exactly; try 0.6 and watch PERFIL's red= before trusting it.
-static float g_net_scale = 1.0f;
+// ResolutionScale owns the experimental physical scaler. The old NetScale key is
+// ignored: NGX always receives ScalingRatio=1 so scaling cannot happen twice.
 // Stage 1 of taking the network off the critical path: it reads our own copies of
 // Color/Depth/MVec instead of the game's textures, still on the graphics queue and
 // still in order. That settles the two unknowns -- whether the copies come out
@@ -777,11 +792,13 @@ struct Codec {
     // cannot keep reading the game's own textures once it stops running in order
     // on the graphics queue, because those are being redrawn for the next frame.
     ID3D12PipelineState *pso_snap = nullptr, *pso_advect = nullptr;
+    ID3D12PipelineState *pso_downsample = nullptr, *pso_decode_scaled = nullptr;
     ID3D12Resource *delta2 = nullptr;   // ping-pong: advection cannot read and write one texture
     ID3D12Resource *snap_color = nullptr, *snap_depth = nullptr, *snap_mv = nullptr;
     bool snap_ready = false;
     ID3D12DescriptorHeap *heap = nullptr;
     ID3D12Resource *proxy = nullptr, *final_tex = nullptr;
+    ID3D12Resource *scaled_input = nullptr;
     ID3D12Resource *delta = nullptr;      // what the network added, reused on skipped frames
     ID3D12PipelineState *pso_hist = nullptr;
     ID3D12Resource *exp_rb = nullptr;      // readback for the game's 1x1 exposure texture
@@ -971,6 +988,20 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
 
     D3D12_ROOT_SIGNATURE_DESC rsd{};
     rsd.NumParameters = 2; rsd.pParameters = rp;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MipLODBias = 0.0f;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    sampler.MinLOD = 0.0f;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rsd.NumStaticSamplers = 1;
+    rsd.pStaticSamplers = &sampler;
     ID3DBlob *sig = nullptr;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
         logf("[NRPRE] codec: root signature serialise failed"); return false;
@@ -1069,6 +1100,55 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
          (void *)g_cx.proxy, (void *)g_cx.final_tex);
     return g_cx.ready;
 }
+
+static bool scaler_init(ID3D12Device *dev) {
+    if (g_cx.pso_downsample && g_cx.pso_decode_scaled) return true;
+    if (!g_cx.root) return false;
+    struct CompileResources {
+        HMODULE module = LoadLibraryW(L"d3dcompiler_47.dll");
+        ID3DBlob *down = nullptr, *decode = nullptr, *err = nullptr;
+        ~CompileResources() {
+            if (down) down->Release();
+            if (decode) decode->Release();
+            if (err) err->Release();
+            if (module) FreeLibrary(module);
+        }
+    } resources;
+    HMODULE dc = resources.module;
+    auto compile = dc ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+    if (!compile) return false;
+    auto &down = resources.down; auto &decode = resources.decode; auto &err = resources.err;
+    HRESULT hr = compile(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                         "CSDownsample", "cs_5_0", 0, 0, &down, &err);
+    if (FAILED(hr)) {
+        logf("[NRPRE] scaler: CSDownsample failed 0x%08lX %s", (unsigned long)hr,
+             err ? (const char *)err->GetBufferPointer() : "");
+        return false;
+    }
+    if (err) { err->Release(); err = nullptr; }
+    hr = compile(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                 "CSDecodeScaled", "cs_5_0", 0, 0, &decode, &err);
+    if (FAILED(hr)) {
+        logf("[NRPRE] scaler: CSDecodeScaled failed 0x%08lX %s", (unsigned long)hr,
+             err ? (const char *)err->GetBufferPointer() : "");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_cx.root;
+    pd.CS.pShaderBytecode = down->GetBufferPointer();
+    pd.CS.BytecodeLength = down->GetBufferSize();
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_downsample))))
+        return false;
+    pd.CS.pShaderBytecode = decode->GetBufferPointer();
+    pd.CS.BytecodeLength = decode->GetBufferSize();
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_decode_scaled)))) {
+        g_cx.pso_downsample->Release();
+        g_cx.pso_downsample = nullptr;
+        return false;
+    }
+    logf("[NRPRE] scaler: compute pipelines ready");
+    return true;
+}
 static bool g_want_hi = false;   // F8 asks for the output-res feature; built on demand
 static void build_hi(ID3D12GraphicsCommandList *cmd);
 typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_Eval)(ID3D12GraphicsCommandList *,
@@ -1085,14 +1165,6 @@ static ID3D12Resource   *g_nr_out_hi = nullptr;
 static NVSDK_NGX_Parameter *g_nr_params_hi = nullptr;
 static bool              g_use_hi = false;        // F8
 static constexpr int     g_repeat = 1;            // repeated NR compounds the image
-// Chained passes stage each result into this buffer and the next pass reads the
-// copy. A texture cannot read and write itself at once, and the network's
-// D3D12 backend did not tolerate a buffer it had just written being handed
-// back as an input in the same frame (E_INVALIDARG on the first multi-pass
-// frame), so the copy is what makes the chain safe: the network's output stays
-// 'out' on every pass, and 'stage' is only ever an input.
-static ID3D12Resource   *g_nr_stage = nullptr;
-static ID3D12Resource   *g_nr_stage_hi = nullptr;
 static bool              g_rebind = true;         // F10: feed NR output into DLSS (visible)
 // Every frame is the default: since the cadence anchors on the jitter, this is one
 // NR pass per frame in the pass that is actually shown. The old evaluate counter ran
@@ -1517,8 +1589,10 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 ? std::min(g_dlss_output_h, output_allocation_h) : output_allocation_h;
             // Feature and codec textures use allocation dimensions. RenderSubrect only
             // describes the valid depth region; some games pad Color by a few rows.
-            const unsigned work_w = hi ? output_allocation_w : w_net;
-            const unsigned work_h = hi ? output_allocation_h : h_net;
+            const bool scale_active = !hi && g_codec_on && !g_scale_failed_session &&
+                                      g_active_resolution_scale < nr::kNativeResolutionThreshold;
+            const unsigned work_w = hi ? output_allocation_w : (scale_active ? g_work_w : w_net);
+            const unsigned work_h = hi ? output_allocation_h : (scale_active ? g_work_h : h_net);
             const bool motion_low_resolution = g_dlss_flags_known
                 ? (g_dlss_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
                 : ((unsigned)motion_desc.Width <= render_w && motion_desc.Height <= render_h);
@@ -1553,8 +1627,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                       guide_metadata.motion.base_y == 0 &&
                                       motion_desc.Width == work_w && motion_desc.Height == work_h;
             g_guides_force_quality = !local_guides;
-            const int effective_cadence = local_guides ? g_skip_n : 1;
-            const bool temporal_reuse_allowed = effective_cadence > 1;
+            const int effective_cadence = (local_guides && !scale_active) ? g_skip_n : 1;
+            const bool temporal_reuse_allowed = !scale_active && effective_cadence > 1;
             if (!temporal_reuse_allowed) g_delta_valid = false;
             if (!local_guides && (g_async_net || g_skip_n > 1)) {
                 static bool warned_nonlocal_guides = false;
@@ -1566,11 +1640,26 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const bool use_codec = g_codec_on && !hi && g_device != nullptr
                                    && codec_init(g_device, w_net, h_net);
+            const bool use_scaled = scale_active && use_codec && g_cx.scaled_input != nullptr &&
+                                    scaler_init(g_device);
+            if (scale_active && !use_scaled) {
+                g_scale_failed_session = true;
+                g_scale_restart_required = true;
+                g_final_valid = g_delta_valid = false;
+                release_state("scaled pipeline creation failed");
+                logf("[NRPRE] scaler: setup failed; current frame passthrough, native fallback scheduled");
+                return t_orig_eval(cmd, feat, params, cb);
+            }
             // Preflight the entire evaluation before snapshots, encode or NR.
             // Allocation failure must pass the current game input through, never
             // skip an individual pass and pretend its old output is current.
             if ((g_codec_on && !hi && !use_codec) ||
                 (g_cx.ready && !cx_begin_batch(cmd, g_device))) {
+                if (scale_active) {
+                    g_scale_failed_session = true;
+                    g_scale_restart_required = true;
+                    release_state("scaled descriptor allocation failed");
+                }
                 ++g_descriptor_bypass;
                 g_final_valid = g_delta_valid = false;
                 g_reset_pending = true;
@@ -1590,9 +1679,10 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                     recording_tracked = true;
                 }
             };
-            ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
+            ID3D12Resource *net_color = use_scaled ? g_cx.scaled_input : in;
+            ID3D12Resource *net_depth = dep, *net_mv = mv;
             bool snapshot_used = false;
-            if (g_async_net && !hi && local_guides && g_cx.pso_snap != nullptr &&
+            if (g_async_net && !hi && !use_scaled && local_guides && g_cx.pso_snap != nullptr &&
                 dep != nullptr && mv != nullptr) {
                 if (!g_cx.snap_ready) {
                     g_cx.snap_color = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1771,10 +1861,8 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            const D3D12_RESOURCE_STATES kCS  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            const D3D12_RESOURCE_STATES kCD  = D3D12_RESOURCE_STATE_COPY_DEST;
 
-            g_net_w = w_net; g_net_h = h_net;
+            g_net_w = work_w; g_net_h = work_h;
 
             if (use_codec && g_auto_pw && run_now) {
                 ensure_recording();
@@ -1797,39 +1885,21 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                    g_cx.proxy, w_net, h_net);
                     uav_barrier(cmd, g_cx.proxy);
                     barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);   // NGX reads inputs as SRV
-                }
-
-                // Passes are chained, not repeated: each pass reads the previous
-                // pass's result, so the effect compounds instead of re-running the
-                // same input N times. The result is copied to 'stage' between
-                // passes: a texture cannot be its own input and output at once, and
-                // handing the network a buffer it just wrote in the same frame is
-                // what broke the D3D12 backend, so 'stage' is only ever an input
-                // and the network's output stays 'out' on every pass.
-                ID3D12Resource *stage = hi ? g_nr_stage_hi : g_nr_stage;
-                ID3D12Resource *cur_in = use_codec ? g_cx.proxy : in;
-                bool staged = false;
-                for (int k = 0; k < g_repeat; ++k) {
-                    pset_res(pp, "DLSSNR.Color",  cur_in);
-                    pset_res(pp, "DLSSNR.Output", out);
-                    prof_mark(cmd, 1);
-                    er = (hi ? g_snip_eval : g_nr_eval)(cmd, hh, pp, nullptr);
-                    uav_barrier(cmd, out);
-                    prof_mark(cmd, 2);
-                    if (er != NVSDK_NGX_Result_Success) break;
-                    if (k + 1 < g_repeat) {
-                        barrier_transition(cmd, out,   kUAV, kCS);
-                        barrier_transition(cmd, stage, staged ? kSRV : kUAV, kCD);
-                        cmd->CopyResource(stage, out);
-                        barrier_transition(cmd, out,   kCS, kUAV);
-                        barrier_transition(cmd, stage, kCD, kSRV);
-                        cur_in = stage;
-                        staged = true;
+                    if (use_scaled) {
+                        codec_dispatch(cmd, g_device, g_cx.pso_downsample, g_cx.proxy,
+                                       nullptr, nullptr, g_cx.scaled_input, work_w, work_h);
+                        uav_barrier(cmd, g_cx.scaled_input);
+                        barrier_transition(cmd, g_cx.scaled_input, kUAV, kSRV);
                     }
                 }
-                // After a staged pass the stage buffer sits in SRV (it was the
-                // last input); park it in UAV so the next frame can stage into it.
-                if (staged) barrier_transition(cmd, stage, kSRV, kUAV);
+
+                pset_res(pp, "DLSSNR.Color", use_scaled ? g_cx.scaled_input
+                                                       : (use_codec ? g_cx.proxy : in));
+                pset_res(pp, "DLSSNR.Output", out);
+                prof_mark(cmd, 1);
+                er = (hi ? g_snip_eval : g_nr_eval)(cmd, hh, pp, nullptr);
+                uav_barrier(cmd, out);
+                prof_mark(cmd, 2);
                 ++g_eval_count;
                 g_reset_pending = (er != NVSDK_NGX_Result_Success);
                 if (er != NVSDK_NGX_Result_Success) {
@@ -1840,11 +1910,40 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                         logf("[NRPRE] NR Evaluate failed 0x%08X; current input passthrough (%u)",
                              (unsigned)er, g_er_fail);
                     if (use_codec) barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);
+                    if (use_scaled)
+                        barrier_transition(cmd, g_cx.scaled_input, kSRV, kUAV);
+                    if (use_scaled) {
+                        g_scale_failed_session = true;
+                        g_scale_restart_required = true;
+                        release_state("scaled NR evaluate failed");
+                    }
                 }
 
                 if (use_codec && er == NVSDK_NGX_Result_Success) {
                     g_codec_settings_dirty = false;
                     barrier_transition(cmd, out, kUAV, kSRV);          // decode reads NR output
+                    if (use_scaled) {
+                        const bool depth_guard = guide_metadata.depth.base_x == 0 &&
+                            guide_metadata.depth.base_y == 0 && depth_desc.SampleDesc.Count == 1 &&
+                            depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                            depth_desc.DepthOrArraySize == 1 &&
+                            guide_metadata.depth.width >= w_net &&
+                            guide_metadata.depth.height >= h_net &&
+                            (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ||
+                             depth_desc.Format == DXGI_FORMAT_R32_FLOAT ||
+                             depth_desc.Format == DXGI_FORMAT_R16_TYPELESS ||
+                             depth_desc.Format == DXGI_FORMAT_R16_UNORM ||
+                             depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+                             depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS) &&
+                            (depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0;
+                        codec_dispatch(cmd, g_device, g_cx.pso_decode_scaled,
+                                       in, g_cx.proxy, out, g_cx.final_tex, w_net, h_net,
+                                       g_cx.scaled_input, depth_guard ? dep : nullptr,
+                                       depth_guard);
+                        uav_barrier(cmd, g_cx.final_tex);
+                        barrier_transition(cmd, g_cx.scaled_input, kSRV, kUAV);
+                        g_delta_valid = false;
+                    } else {
                     // Uniform mode: this frame is developed from the delta that is
                     // already stored, exactly as the frames between are, so no frame
                     // is built differently from its neighbours. The result the
@@ -1872,6 +1971,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                         uav_barrier(cmd, g_cx.delta);
                         g_delta_valid = true;
                         g_delta_age = 1;   // fresh again
+                    }
                     }
                     barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);   // restore for next frame
                     barrier_transition(cmd, out,        kSRV, kUAV);
@@ -2243,6 +2343,27 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
     if (dev_from_cmd != nullptr) g_device = dev_from_cmd;
     if (g_device == nullptr) { logf("[NRPRE] 2a: no ID3D12Device"); return; }
 
+    nr::ResolutionPlan resolution = nr::resolve_resolution_plan(
+        w, h, (g_codec_on && !g_scale_failed_session) ? g_active_resolution_scale : 1.0f);
+    if (!g_codec_on && g_active_resolution_scale < nr::kNativeResolutionThreshold) {
+        g_scale_restart_required = true;
+        logf("[NRPRE] scaler: Codec=0 requires native resolution; using 1.0 until codec is enabled");
+    }
+    if (resolution.scaled) {
+        if (!g_cx.scaled_input)
+            g_cx.scaled_input = make_uav_tex(g_device, resolution.width, resolution.height,
+                                             DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (!g_cx.scaled_input) {
+            g_scale_failed_session = true;
+            g_scale_restart_required = true;
+            g_active_resolution_scale = 1.0f;
+            logf("[NRPRE] scaler: low-resolution input allocation failed; falling back to 1.0");
+            return;
+        }
+    }
+    g_work_w = resolution.width;
+    g_work_h = resolution.height;
+
     HMODULE core = GetModuleHandleW(L"_nvngx.dll");
     auto alloc_params = reinterpret_cast<PFN_AllocParams>(
         core ? GetProcAddress(core, "NVSDK_NGX_D3D12_AllocateParameters") : nullptr);
@@ -2258,8 +2379,8 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         if (r != NVSDK_NGX_Result_Success || g_nr_params == nullptr) return;
     }
 
-    pset_u(g_nr_params, "DLSSNR.Width",  w);
-    pset_u(g_nr_params, "DLSSNR.Height", h);
+    pset_u(g_nr_params, "DLSSNR.Width",  g_work_w);
+    pset_u(g_nr_params, "DLSSNR.Height", g_work_h);
     pset_u(g_nr_params, "DLSSNR.Enabled", 1);
 
     // The game already initialised the NGX core for this device, so we piggyback on it:
@@ -2311,18 +2432,20 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
 
     pset_u(g_nr_params, "DLSSNR.Hint.Render.Preset", 0);
     pset_u(g_nr_params, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
-    pset_f(g_nr_params, "DLSSNR.ScalingRatio", g_net_scale);
-    logf("[NRPRE] 2b: ScalingRatio=%.3f (1.0 = misma resolucion dentro y fuera)", g_net_scale);
+    pset_f(g_nr_params, "DLSSNR.ScalingRatio", 1.0f);
+    logf("[NRPRE] scaler: active=%.3f native=%ux%u work=%ux%u pixel-cost=%.1f%%; NGX ratio=1.0",
+         g_active_resolution_scale, w, h, g_work_w, g_work_h,
+         100.0f * (float)g_work_w * (float)g_work_h / ((float)w * (float)h));
     pset_u(g_nr_params, "DLSSNR.UseAutoMask", g_auto_mask ? 1u : 0u);
     pset_u(g_nr_params, "DLSSNR.Style", (unsigned)g_style);
     // Geometry. Without these the subrect defaults to zero and the network is asked
     // to process a 0x0 region: every evaluate returns success and does no work.
     // On an RTX 4090 with the 310.8.0-RTX40 runtime this is the difference between
     // 0.000 ms and 8.0 ms of real network time.
-    pset_u(g_nr_params, "DLSSNR.InputWidth",   w);
-    pset_u(g_nr_params, "DLSSNR.InputHeight",  h);
-    pset_u(g_nr_params, "DLSSNR.OutputWidth",  w);
-    pset_u(g_nr_params, "DLSSNR.OutputHeight", h);
+    pset_u(g_nr_params, "DLSSNR.InputWidth",   g_work_w);
+    pset_u(g_nr_params, "DLSSNR.InputHeight",  g_work_h);
+    pset_u(g_nr_params, "DLSSNR.OutputWidth",  g_work_w);
+    pset_u(g_nr_params, "DLSSNR.OutputHeight", g_work_h);
     static const char *const kSubW[] = { "DLSSNR.ColorSubrectWidth",  "DLSSNR.DepthSubrectWidth",
                                          "DLSSNR.MVecSubrectWidth",   "DLSSNR.OutputSubrectWidth" };
     static const char *const kSubH[] = { "DLSSNR.ColorSubrectHeight", "DLSSNR.DepthSubrectHeight",
@@ -2331,19 +2454,29 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
                                          "DLSSNR.DepthSubrectBaseX",  "DLSSNR.DepthSubrectBaseY",
                                          "DLSSNR.MVecSubrectBaseX",   "DLSSNR.MVecSubrectBaseY",
                                          "DLSSNR.OutputSubrectBaseX", "DLSSNR.OutputSubrectBaseY" };
-    for (int i = 0; i < 4; ++i) { pset_u(g_nr_params, kSubW[i], w); pset_u(g_nr_params, kSubH[i], h); }
+    for (int i = 0; i < 4; ++i) {
+        pset_u(g_nr_params, kSubW[i], g_work_w);
+        pset_u(g_nr_params, kSubH[i], g_work_h);
+    }
     for (int i = 0; i < 8; ++i) pset_u(g_nr_params, kSubB[i], 0);
 
     pset_u(g_nr_params, "CreationNodeMask", 1);
     pset_u(g_nr_params, "VisibilityNodeMask", 1);
 
     if (!g_nr_out)
-        g_nr_out = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    if (!g_nr_out) { logf("[NRPRE] NR output allocation failed"); return; }
+        g_nr_out = make_uav_tex(g_device, g_work_w, g_work_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (!g_nr_out) {
+        logf("[NRPRE] NR output allocation failed");
+        if (resolution.scaled) {
+            if (g_cx.scaled_input) { g_cx.scaled_input->Release(); g_cx.scaled_input = nullptr; }
+            g_scale_failed_session = true;
+            g_scale_restart_required = true;
+            g_active_resolution_scale = 1.0f;
+            logf("[NRPRE] scaler: output allocation failed; native fallback scheduled");
+        }
+        return;
+    }
     pset_res(g_nr_params, "DLSSNR.Output", g_nr_out);
-    if (!g_nr_stage)
-        g_nr_stage = make_uav_tex(g_device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    if (!g_nr_stage) logf("[NRPRE] NR staging buffer allocation failed; chained passes limited to one");
     g_setup_w = w; g_setup_h = h;
 
     auto core_eval = reinterpret_cast<PFN_Eval>(GetProcAddress(core, "NVSDK_NGX_D3D12_EvaluateFeature"));
@@ -2361,7 +2494,7 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         g_nr_core_owned = true;
     }
     logf("[NRPRE] 2b: CORE CreateFeature(18, %ux%u) -> 0x%08X handle=%p",
-         w, h, (unsigned)r, (void *)g_nr_handle);
+         g_work_w, g_work_h, (unsigned)r, (void *)g_nr_handle);
 
     if (g_nr_handle == nullptr) {
         // Core route is dead (it will not instantiate feature 18 from a snippet it
@@ -2413,14 +2546,29 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
                     }
                     logf("[NRPRE] 2b: <- returned");
                     logf("[NRPRE] 2b: SNIPPET CreateFeature(18, %ux%u) -> 0x%08X handle=%p",
-                         w, h, (unsigned)r, (void *)g_nr_handle);
+                         g_work_w, g_work_h, (unsigned)r, (void *)g_nr_handle);
                 }
                 // Whatever happened, stop here. Retrying a creation that failed once
                 // has never produced a handle, and doing it every frame is how a
                 // failure becomes a hang instead of simply no effect.
-                if (g_nr_handle == nullptr) { g_setup_done = true; return; }
+                if (g_nr_handle == nullptr) {
+                    if (resolution.scaled) {
+                        g_scale_failed_session = true;
+                        g_scale_restart_required = true;
+                        release_state("scaled NR feature creation failed");
+                        logf("[NRPRE] scaler: feature creation failed; native fallback scheduled");
+                    }
+                    g_setup_done = true;
+                    return;
+                }
             }
         }
+    }
+    if (g_nr_handle == nullptr && resolution.scaled && !g_resize_pending) {
+        g_scale_failed_session = true;
+        g_scale_restart_required = true;
+        release_state("scaled NR feature creation failed");
+        logf("[NRPRE] scaler: feature creation unavailable; native fallback scheduled");
     }
     if (g_nr_handle != nullptr) {
         HMODULE snip = GetModuleHandleW(L"nvngx_dlssnr.dll");
@@ -2457,8 +2605,6 @@ static void build_hi(ID3D12GraphicsCommandList *cmd) {
             g_nr_out_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
             if (!g_nr_out_hi) return;
             pset_res(g_nr_params_hi, "DLSSNR.Output", g_nr_out_hi);
-            g_nr_stage_hi = make_uav_tex(g_device, g_out_w, g_out_h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-            if (!g_nr_stage_hi) logf("[NRPRE] HI staging buffer allocation failed; chained passes limited to one");
             pset_u(g_nr_params_hi, "DLSSNR.InputWidth", g_out_w);
             pset_u(g_nr_params_hi, "DLSSNR.InputHeight", g_out_h);
             pset_u(g_nr_params_hi, "DLSSNR.OutputWidth", g_out_w);
@@ -2483,7 +2629,8 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
                            ID3D12PipelineState *pso,
                            ID3D12Resource *t0, ID3D12Resource *t1, ID3D12Resource *t2,
                            ID3D12Resource *u0, unsigned w, unsigned h,
-                           ID3D12Resource *t3, ID3D12Resource *t4)
+                           ID3D12Resource *t3, ID3D12Resource *t4,
+                           bool scaled_depth_available)
 {
     unsigned slot = 0;
     if (!cx_slot_acquire(cmd, slot)) return;   // preflight guarantees room
@@ -2561,7 +2708,7 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     if (pw_effective > 4.00f) pw_effective = 4.00f;
     struct { UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
              float mvx, mvy, reproj, dreject, sgate, strength, chroma; UINT curve;
-             float detail, lighting, padding[2]; } k{
+             float detail, lighting; UINT scaled_depth; float padding; } k{
         w, h, pw_effective, g_transfer, g_color_strength, hdr_mode, g_knee, g_delta_clamp,
         g_mv_scale_x, g_mv_scale_y,
         // advected: it is already in place, so do not move it again
@@ -2569,7 +2716,8 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
             : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
         g_depth_reject, g_struct_gate,
         g_controls.effect_strength, g_chroma_transfer, (UINT)g_encode_curve,
-        g_detail_strength, g_lighting_strength, {0.0f, 0.0f} };
+        g_detail_strength, g_lighting_strength,
+        scaled_depth_available ? 1u : 0u, 0.0f };
     static_assert(sizeof(k) == kCodecConstants * sizeof(UINT));
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
@@ -2694,10 +2842,16 @@ static void load_settings(reshade::api::effect_runtime *rt) {
         g_diagnostics = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAdvect", v)) g_delta_advect = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAgeScale", v)) g_delta_age_scale = (v != 0);
-    if (reshade::get_config_value(rt, "NRPreUpscale", "NetScale", f))
-        g_net_scale = (f < 0.25f ? 0.25f : (f > 1.0f ? 1.0f : f));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Cadence", v))       g_skip_n = (v < 1 ? 1 : (v > 3 ? 3 : v));
-    if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         g_codec_on = (v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         set_codec_enabled(v != 0);
+    if (reshade::get_config_value(rt, "NRPreUpscale", "ResolutionScale", f))
+        g_requested_resolution_scale = nr::clamp_resolution_scale(f);
+    if (!g_resolution_setting_loaded) {
+        g_active_resolution_scale = g_codec_on ? g_requested_resolution_scale : 1.0f;
+        g_scale_restart_required = !g_codec_on &&
+            g_requested_resolution_scale < nr::kNativeResolutionThreshold;
+        g_resolution_setting_loaded = true;
+    }
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoMask", v)) g_auto_mask = (v != 0);
     // ReShade re-creates the effect runtime several times per session; do not let
     // a reload stomp the value the auto-exposure has already converged on.
@@ -2737,9 +2891,10 @@ static void load_settings(reshade::api::effect_runtime *rt) {
                                   g_controls.effect_strength);
     }
     if (g_auto_pw && g_pw_valid) return;   // already converged, keep it
-    logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f "
+    logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d scale=%.3f pw=%.3f knee=%.2f "
          "strength=%.3f transfer=%.3f intensity=%.3f rebind=%d curve=%d detail=%.3f lighting=%.3f",
-         (int)g_controls.enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee,
+         (int)g_controls.enabled, g_skip_n, (int)g_codec_on,
+         g_requested_resolution_scale, g_paper_white, g_knee,
          g_controls.effect_strength, g_transfer, g_intensity, (int)g_rebind,
          g_encode_curve, g_detail_strength, g_lighting_strength);
 }
@@ -2771,7 +2926,8 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "LightingStrength", g_lighting_strength);
     reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_controls.enabled ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
-    reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
+    reshade::set_config_value(rt, "NRPreUpscale", "ResolutionScale", g_requested_resolution_scale);
+    reshade::set_config_value(rt, "NRPreUpscale", "NetScale", 1.0f);
     reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "DeveloperDiagnostics", g_diagnostics ? 1 : 0);
@@ -2902,6 +3058,65 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::TextDisabled("Network passes: 1 (locked for stability)");
 
     ImGui::Spacing();
+    ImGui::SeparatorText("Experimental resolution scaler");
+    if (ImGui::SliderFloat("Neural resolution scale", &g_requested_resolution_scale,
+                           nr::kMinResolutionScale, nr::kMaxResolutionScale, "%.2f")) {
+        g_requested_resolution_scale = nr::clamp_resolution_scale(g_requested_resolution_scale);
+        changed = true;
+    }
+    if (ImGui::Button("100%")) { g_requested_resolution_scale = 1.00f; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::Button("85%")) { g_requested_resolution_scale = 0.85f; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::Button("75%")) { g_requested_resolution_scale = 0.75f; changed = true; }
+
+    const nr::ResolutionPlan active_plan = nr::resolve_resolution_plan(
+        g_setup_w, g_setup_h, g_active_resolution_scale);
+    const nr::ResolutionPlan requested_plan = nr::resolve_resolution_plan(
+        g_setup_w, g_setup_h, g_requested_resolution_scale);
+    if (g_setup_w && g_setup_h) {
+        ImGui::TextDisabled("Active: %.0f%%  %ux%u", g_active_resolution_scale * 100.0f,
+                            active_plan.width, active_plan.height);
+        ImGui::TextDisabled("Requested: %.0f%%  %ux%u  (~%.1f%% pixel cost)",
+                            g_requested_resolution_scale * 100.0f,
+                            requested_plan.width, requested_plan.height,
+                            100.0f * (float)requested_plan.width * requested_plan.height /
+                            ((float)g_setup_w * g_setup_h));
+    } else {
+        ImGui::TextDisabled("Active: %.0f%%  Requested: %.0f%%  (~%.1f%% pixel cost)",
+                            g_active_resolution_scale * 100.0f,
+                            g_requested_resolution_scale * 100.0f,
+                            g_requested_resolution_scale * g_requested_resolution_scale * 100.0f);
+    }
+    const bool scale_changed = std::fabs(g_requested_resolution_scale -
+                                         g_active_resolution_scale) > 0.0005f;
+    ImGui::BeginDisabled(!scale_changed || g_resize_pending || !g_codec_on);
+    if (ImGui::Button("Apply")) {
+        if (g_submission_failed) {
+            g_scale_restart_required = true;
+            logf("[NRPRE] scaler: live Apply cancelled; submission tracking is unavailable; restart required");
+        } else {
+            g_scale_failed_session = false;
+            g_scale_restart_required = false;
+            g_scale_apply_pending = true;
+            release_state("resolution scale changed");
+            logf("[NRPRE] scaler: Apply requested %.3f; waiting for GPU fences",
+                 g_requested_resolution_scale);
+        }
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    if (!g_codec_on && g_requested_resolution_scale < nr::kNativeResolutionThreshold)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "Codec is required below 100%%; active scale is forced to 100%%.");
+    else if (g_scale_restart_required)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "Live apply unavailable; requested scale will be tried after restart.");
+    else if (g_scale_apply_pending)
+        ImGui::TextDisabled("Waiting for previous GPU work; latest requested value will be applied.");
+    ImGui::SetItemTooltip("Physically reduces the encoded NR input. 100%% uses the exact native pipeline.");
+
+    ImGui::Spacing();
     ImGui::SeparatorText("Exposure");
     ImGui::BeginDisabled(!g_codec_on);
     changed |= ImGui::Checkbox("Auto", &g_auto_pw);
@@ -2943,7 +3158,11 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         ImGui::Spacing();
 
         ImGui::SeparatorText("Colour development");
-        changed |= ImGui::Checkbox("Enable codec", &g_codec_on);
+        bool codec_enabled = g_codec_on;
+        if (ImGui::Checkbox("Enable codec", &codec_enabled)) {
+            set_codec_enabled(codec_enabled);
+            changed = true;
+        }
         ImGui::SetItemTooltip("The network expects a bounded, display-referred image and this "
                               "game hands DLSS a scene-linear HDR buffer, so it is developed "
                               "first and the range restored afterwards. An SDR buffer is "
@@ -3035,7 +3254,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     if (ImGui::Button("Reset to defaults")) {
         g_controls.reset_defaults();
         g_skip_n = 1;
-        g_net_scale = 1.0f;
+        g_requested_resolution_scale = 1.0f;
         g_async_net = false;
         g_uniform_delta = true;
         g_diagnostics = false;
@@ -3065,6 +3284,10 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         g_intensity = 1.0f;
         g_auto_pw = false;
         reset_temporal_history();
+        if (g_active_resolution_scale < nr::kNativeResolutionThreshold && !g_submission_failed) {
+            g_scale_apply_pending = true;
+            release_state("resolution scale reset");
+        }
         logf("[NRPRE] UI: settings reset to defaults; temporal history cleared");
         changed = true;
     }
@@ -3496,8 +3719,9 @@ static void service_pending_cleanup() {
     g_nr_handle = g_nr_handle_hi = nullptr;
 
     auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
-    rls(g_nr_out); rls(g_nr_stage); rls(g_nr_out_hi); rls(g_nr_stage_hi);
-    rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
+    rls(g_nr_out); rls(g_nr_out_hi);
+    rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.scaled_input);
+    rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     for (auto &page : g_descriptor_pages) rls(page.heap);
     g_descriptor_pages.clear();
     g_cx.heap = nullptr;
@@ -3505,7 +3729,8 @@ static void service_pending_cleanup() {
     g_descriptor_end = 0;
     rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);
     rls(g_cx.pso_hist); rls(g_cx.pso_delta); rls(g_cx.pso_apply); rls(g_cx.pso_snap);
-    rls(g_cx.pso_advect); rls(g_cx.delta2);
+    rls(g_cx.pso_advect); rls(g_cx.pso_downsample); rls(g_cx.pso_decode_scaled);
+    rls(g_cx.delta2);
     rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
     g_cx.snap_ready = false;
     rls(g_cx.root); rls(g_cx.fence);
@@ -3534,6 +3759,7 @@ static void service_pending_cleanup() {
     g_dlss_output_known = false;
     g_guides_force_quality = false;
     g_net_w = g_net_h = 0;
+    g_work_w = g_work_h = 0;
     g_setup_w = g_setup_h = 0;
     g_nr_eval = g_snip_eval = nullptr;
     g_nr_release = g_hi_release = nullptr;
@@ -3546,6 +3772,18 @@ static void service_pending_cleanup() {
         entry.queue->Release();
     }
     g_submission_fences.clear();
+    if (g_scale_apply_pending) {
+        g_active_resolution_scale = g_codec_on ? g_requested_resolution_scale : 1.0f;
+        g_scale_restart_required = !g_codec_on &&
+            g_requested_resolution_scale < nr::kNativeResolutionThreshold;
+        g_scale_failed_session = false;
+        g_scale_apply_pending = false;
+        logf("[NRPRE] scaler: requested scale applied safely; active=%.3f",
+             g_active_resolution_scale);
+    } else if (g_scale_failed_session) {
+        g_active_resolution_scale = 1.0f;
+        logf("[NRPRE] scaler: native fallback active after scaled-path failure");
+    }
     g_resize_pending = false;
 }
 

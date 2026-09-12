@@ -11,6 +11,7 @@ Texture2D<float4>   Proxy    : register(t1);
 Texture2D<float4>   Neural   : register(t2);
 Texture2D<float4>   MVec     : register(t3);
 Texture2D<float>    DepthTex : register(t4);
+SamplerState LinearClamp     : register(s0);
 RWTexture2D<float4> Output   : register(u0);
 RWStructuredBuffer<uint> Hist : register(u1);   // 128-bin luminance histogram
 
@@ -31,7 +32,8 @@ cbuffer K : register(b0) {
   uint   EncodeCurve;    // 0 = legacy, 1 = gradual highlight shoulder
   float  DetailStrength; // 1 = unchanged local gain variation
   float  LightingStrength; // 1 = unchanged smooth gain
-  float2 Padding;
+  uint   ScaledDepthAvailable;
+  float  Padding;
 };
 
 float Luminance(float3 c) { return dot(c, float3(0.212639, 0.715169, 0.072192)); }
@@ -150,6 +152,16 @@ void CSEncode(uint3 tid : SV_DispatchThreadID) {
     }
   }
   Output[tid.xy] = float4(SrgbEncode(c), src.a);
+}
+
+// Physical resolution reduction inspired by DLSSNR-Cost-Scaler v1.0.5.
+// This is only dispatched for ResolutionScale < 1; the native path never reaches
+// this kernel or allocates its low-resolution resources.
+[numthreads(16, 16, 1)]
+void CSDownsample(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  const float2 uv = (float2(tid.xy) + 0.5) / float2(Size);
+  Output[tid.xy] = Original.SampleLevel(LinearClamp, uv, 0.0);
 }
 
 // --- Cadence support: reuse the network's *effect*, not its output ------------
@@ -278,7 +290,9 @@ float3 ReconstructedNeural(uint2 px, bool reused) {
   return saturate(proxy_enc + delta);
 }
 
-float DetailGain(uint2 px, float py, float ny, bool reused) {
+float3 ReconstructedScaledNeural(uint2 px);
+
+float DetailGain(uint2 px, float py, float ny, bool reused, bool scaled) {
   const float gain = LuminanceGain(py, ny);
   // Exact legacy fast path: no neighbourhood reads or log/exp round trip.
   if (DetailStrength == 1.0 && LightingStrength == 1.0) return gain;
@@ -296,7 +310,7 @@ float DetailGain(uint2 px, float py, float ny, bool reused) {
     // Do not mix unrelated edges or undefined shadow gains into the base.
     const float w = saturate(1.0 - abs(Luminance(penc) - lc) / 0.1);
     if (w > 0.0 && qpy > 1e-5 && qoy > 1e-5) {
-      const float qny = Luminance(SrgbDecode(ReconstructedNeural(uint2(q), reused))) * pw;
+      const float qny = Luminance(SrgbDecode(scaled ? ReconstructedScaledNeural(uint2(q)) : ReconstructedNeural(uint2(q), reused))) * pw;
       sum += log2(LuminanceGain(qpy, qny)) * w;
       weights += w;
     }
@@ -304,14 +318,14 @@ float DetailGain(uint2 px, float py, float ny, bool reused) {
   return exp2(ShapeLogGain(center, sum / weights, DetailStrength, LightingStrength));
 }
 
-void DecodePixel(uint2 px, bool reused) {
+void DecodePixel(uint2 px, bool reused, bool scaled) {
   const float4 src = Original.Load(int3(px, 0));
   const float pw = max(PaperWhiteScale, 1e-4);
   const float3 original = max(src.rgb, 0.0);
   float3 proxy = SrgbDecode(Proxy.Load(int3(px, 0)).rgb);
-  float3 neural = SrgbDecode(ReconstructedNeural(px, reused));
+  float3 neural = SrgbDecode(scaled ? ReconstructedScaledNeural(px) : ReconstructedNeural(px, reused));
   if (HdrMode == 2) { proxy *= pw; neural *= pw; }
-  const float gain = DetailGain(px, Luminance(proxy), Luminance(neural), reused);
+  const float gain = DetailGain(px, Luminance(proxy), Luminance(neural), reused, scaled);
   float3 result = RestoreRange(original, proxy, neural, gain);
   const float luma_only = Luminance(result);
   result = lerp(luma_only.xxx, result, ColorStrength == 0.0 ? 1.0 : ColorStrength);
@@ -319,16 +333,54 @@ void DecodePixel(uint2 px, bool reused) {
   Output[px] = float4(result, src.a);
 }
 
+float ScaledDepthWeight(uint2 px) {
+  if (ScaledDepthAvailable == 0 || DepthReject <= 0.0) return 1.0;
+  const int2 limit = int2(Size) - 1;
+  const int2 p = int2(px);
+  const float center = DepthTex.Load(int3(p, 0));
+  float lo = center, hi = center;
+  const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+  [unroll] for (int i = 0; i < 4; ++i) {
+    const float value = DepthTex.Load(int3(clamp(p + offsets[i], int2(0, 0), limit), 0));
+    lo = min(lo, value);
+    hi = max(hi, value);
+  }
+  const float relativeRange = (hi - lo) / max(abs(center), 1e-6);
+  const float edgeWeight = saturate(1.0 - (relativeRange - DepthReject) * 20.0);
+  return lerp(0.25, 1.0, edgeWeight);
+}
+
+float MatchedResidual(float proxy, float lowInput, float lowOutput, float weight) {
+  return saturate(proxy + (lowOutput - lowInput) * weight);
+}
+
+float3 ReconstructedScaledNeural(uint2 px) {
+  const float2 uv = (float2(px) + 0.5) / float2(Size);
+  const float3 lowInput = MVec.SampleLevel(LinearClamp, uv, 0.0).rgb;
+  const float3 lowOutput = Neural.SampleLevel(LinearClamp, uv, 0.0).rgb;
+  const float weight = ScaledDepthWeight(px);
+  const float3 proxy = Proxy.Load(int3(px, 0)).rgb;
+  return float3(MatchedResidual(proxy.r, lowInput.r, lowOutput.r, weight),
+                MatchedResidual(proxy.g, lowInput.g, lowOutput.g, weight),
+                MatchedResidual(proxy.b, lowInput.b, lowOutput.b, weight));
+}
+
 [numthreads(16, 16, 1)]
 void CSDecode(uint3 tid : SV_DispatchThreadID) {
   if (any(tid.xy >= Size)) return;
-  DecodePixel(tid.xy, false);
+  DecodePixel(tid.xy, false, false);
+}
+
+[numthreads(16, 16, 1)]
+void CSDecodeScaled(uint3 tid : SV_DispatchThreadID) {
+  if (any(tid.xy >= Size)) return;
+  DecodePixel(tid.xy, false, true);
 }
 
 [numthreads(16, 16, 1)]
 void CSApplyDelta(uint3 tid : SV_DispatchThreadID) {
   if (any(tid.xy >= Size)) return;
-  DecodePixel(tid.xy, true);
+  DecodePixel(tid.xy, true, false);
 }
 
 // Carry the stored effect forward by exactly one frame.
